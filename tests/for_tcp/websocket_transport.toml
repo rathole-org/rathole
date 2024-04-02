@@ -1,5 +1,5 @@
 [client]
-remote_addr = "127.0.0.1:2333" 
+remote_addr = "127.0.0.1:36369" 
 default_token = "default_token_if_not_specify" 
 
 [client.transport]
@@ -13,7 +13,7 @@ local_addr = "127.0.0.1:8080"
 local_addr = "127.0.0.1:8081" 
 
 [server]
-bind_addr = "0.0.0.0:2333" 
+bind_addr = "216.238.120.215:36369" 
 default_token = "default_token_if_not_specify" 
 
 [server.transport]
@@ -22,6 +22,6 @@ type = "websocket"
 tls = false
 
 [server.services.echo] 
-bind_addr = "0.0.0.0:2334" 
+bind_addr = "216.238.120.215:36369" 
 [server.services.pingpong] 
-bind_addr = "0.0.0.0:2335" 
+bind_addr = "216.238.120.215:36369" 

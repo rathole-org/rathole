@@ -55,7 +55,7 @@ Create `server.toml` with the following content and accommodate it to your needs
 bind_addr = "0.0.0.0:2333" # `2333` specifies the port that rathole listens for clients
 
 [server.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # Token that is used to authenticate the client for the service. Change to a arbitrary value.
+token = "use_a_secret_that_only_you_know" # Token that is used to authenticate the client for the service. Change to an arbitrary value.
 bind_addr = "0.0.0.0:5202" # `5202` specifies the port that exposes `my_nas_ssh` to the Internet
 ```
 

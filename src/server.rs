@@ -1,7 +1,7 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
-use crate::helper::retry_notify_with_deadline;
+use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
@@ -25,9 +25,9 @@ use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span}
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
-#[cfg(feature = "tls")]
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
 use crate::transport::TlsTransport;
-#[cfg(feature = "websocket")]
+#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 use crate::transport::WebsocketTransport;
 
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
@@ -57,13 +57,13 @@ pub async fn run_server(
             server.run(shutdown_rx, update_rx).await?;
         }
         TransportType::Tls => {
-            #[cfg(feature = "tls")]
+            #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
                 let mut server = Server::<TlsTransport>::from(config).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
-            #[cfg(not(feature = "tls"))]
-            crate::helper::feature_not_compile("tls")
+            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+            crate::helper::feature_neither_compile("native-tls", "rustls")
         }
         TransportType::Noise => {
             #[cfg(feature = "noise")]
@@ -75,13 +75,13 @@ pub async fn run_server(
             crate::helper::feature_not_compile("noise")
         }
         TransportType::Websocket => {
-            #[cfg(feature = "websocket")]
+            #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
                 let mut server = Server::<WebsocketTransport>::from(config).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
-            #[cfg(not(feature = "websocket"))]
-            crate::helper::feature_not_compile("websocket")
+            #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
+            crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
         }
     }
 
@@ -498,14 +498,9 @@ struct ControlChannel<T: Transport> {
 
 impl<T: Transport> ControlChannel<T> {
     async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
-        self.conn
-            .write_all(data)
+        write_and_flush(&mut self.conn, data)
             .await
             .with_context(|| "Failed to write control cmds")?;
-        self.conn
-            .flush()
-            .await
-            .with_context(|| "Failed to flush control cmds")?;
         Ok(())
     }
     // Run a control channel
@@ -640,7 +635,7 @@ async fn run_tcp_connection_pool<T: Transport>(
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
-                if ch.write_all(&cmd).await.is_ok() {
+                if write_and_flush(&mut ch, &cmd).await.is_ok() {
                     tokio::spawn(async move {
                         let _ = copy_bidirectional(&mut ch, &mut visitor).await;
                     });
@@ -690,7 +685,7 @@ async fn run_udp_connection_pool<T: Transport>(
         .recv()
         .await
         .ok_or_else(|| anyhow!("No available data channels"))?;
-    conn.write_all(&cmd).await?;
+    write_and_flush(&mut conn, &cmd).await?;
 
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {

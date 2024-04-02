@@ -83,7 +83,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                 if let Some((i, _)) = last_instance {
                     info!("General configuration change detected. Restarting...");
                     shutdown_tx.send(true)?;
-                    i.await?;
+                    i.await??;
                 }
 
                 debug!("{:?}", config);
@@ -119,8 +119,8 @@ async fn run_instance(
     args: Cli,
     shutdown_rx: broadcast::Receiver<bool>,
     service_update: mpsc::Receiver<ConfigChange>,
-) {
-    let ret: Result<()> = match determine_run_mode(&config, &args) {
+) -> Result<()> {
+    match determine_run_mode(&config, &args) {
         RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
         RunMode::Client => {
             #[cfg(not(feature = "client"))]
@@ -134,8 +134,7 @@ async fn run_instance(
             #[cfg(feature = "server")]
             run_server(config, shutdown_rx, service_update).await
         }
-    };
-    ret.unwrap();
+    }
 }
 
 #[derive(PartialEq, Eq, Debug)]

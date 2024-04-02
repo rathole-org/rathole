@@ -112,8 +112,7 @@ impl UdpTraffic {
     }
 
     pub async fn read<T: AsyncRead + Unpin>(reader: &mut T, hdr_len: u8) -> Result<UdpTraffic> {
-        let mut buf = Vec::new();
-        buf.resize(hdr_len as usize, 0);
+        let mut buf = vec![0; hdr_len as usize];
         reader
             .read_exact(&mut buf)
             .await

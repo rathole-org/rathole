@@ -56,7 +56,8 @@ openssl x509 -req \
     -sha256 -extfile cert.conf
 
 # create pkcs12
-openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile rootCA.crt -passout pass:1234
+openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile rootCA.crt \
+    -passout pass:1234 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
 
 # clean up
 rm server.csr csr.conf cert.conf

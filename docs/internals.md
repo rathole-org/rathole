@@ -30,5 +30,5 @@ When `rathole` starts in the client mode, it creates connections to `server.comm
 
 When a control channel starts, the server challenge the client by a nonce, the client is required to authenticate as the service it wants to represent. Then the forwarding of that service is set up.
 
-When the server accepts a connection on a service's `bind_port`, it sends a control command to the client via the corresponding contorl channel. Then the client connects to the server to create a data channel. In this way, a forwarding is set up. The server also creates a few data channels in advance to improve the latency.
+When the server accepts a connection on a service's `bind_port`, it sends a control command to the client via the corresponding control channel. Then the client connects to the server to create a data channel. In this way, a forwarding is set up. The server also creates a few data channels in advance to improve the latency.
 

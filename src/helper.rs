@@ -87,7 +87,7 @@ pub async fn tcp_connect_with_proxy(
         let addr = &addr.addr;
         let mut s = TcpStream::connect((
             url.host_str().expect("proxy url should have host field"),
-            url.port().expect("proxy url should have port field"),
+            url.port_or_known_default().expect("proxy url should have port field"),
         ))
         .await?;
 

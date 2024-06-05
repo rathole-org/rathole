@@ -127,7 +127,7 @@ rustls-pemfile = { version = "2.0", optional = true }
 p12 = { version = "0.6.3", optional = true }
 
 [target.'cfg(target_env = "musl")'.dependencies]
-openssl = { version = "0.10", features = ["vendored"] }
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [build-dependencies]
 vergen = { version = "7.4.2", default-features = false, features = [

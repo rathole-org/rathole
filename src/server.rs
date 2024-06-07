@@ -6,7 +6,7 @@ use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
-    HASH_WIDTH_IN_BYTES,
+    HASH_WIDTH_IN_BYTES, read_server_service_config_from_client,
 };
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
@@ -297,16 +297,34 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         .await?;
     conn.flush().await?;
 
+    
+    // Read auth
+    let protocol::Auth(d) = read_auth(&mut conn).await?;
+
     // Lookup the service
     let service_config = match services.read().await.get(&service_digest) {
-        Some(v) => v,
+        Some(v) => v.clone(),
         None => {
-            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
-                .await?;
-            bail!("No such a service {}", hex::encode(service_digest));
+            let op = match server_config.accept_client_recommend_service {
+                true => {
+                    match read_server_service_config_from_client(&mut conn).await { // Send ACK::RequireServiceConfig
+                        Ok(config) => Some(config),
+                        Err(_) => None,
+                    }
+                },
+                false => None,
+            }; 
+
+            match op {
+                Some(config) => config,
+                None => {
+                    conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
+                    .await?;
+                    bail!("No such a service {}", hex::encode(service_digest));
+                }
+            }
         }
-    }
-    .to_owned();
+    };
 
     let service_name = &service_config.name;
 
@@ -314,8 +332,6 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
     concat.append(&mut nonce);
 
-    // Read auth
-    let protocol::Auth(d) = read_auth(&mut conn).await?;
 
     // Validate
     let session_key = protocol::digest(&concat);

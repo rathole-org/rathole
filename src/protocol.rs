@@ -8,6 +8,8 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::trace;
 
+use crate::config::{ClientServiceConfig, ServerServiceConfig};
+
 type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
 const PROTO_V1: u8 = 1u8;
@@ -30,6 +32,7 @@ pub enum Ack {
     Ok,
     ServiceNotExist,
     AuthFailed,
+    RequireServiceConfig,
 }
 
 impl std::fmt::Display for Ack {
@@ -41,6 +44,7 @@ impl std::fmt::Display for Ack {
                 Ack::Ok => "Ok",
                 Ack::ServiceNotExist => "Service not exist",
                 Ack::AuthFailed => "Incorrect token",
+                Ack::RequireServiceConfig => "Try to use service config defined in client",
             }
         )
     }
@@ -204,6 +208,34 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
     }
 
     Ok(hello)
+}
+
+pub async fn read_server_service_config_from_client<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<ServerServiceConfig> {
+    conn.write_all(&bincode::serialize(&Ack::RequireServiceConfig).unwrap())
+    .await?;
+    conn.flush().await?;
+
+    let n = conn.read_u32()
+        .await
+        .with_context(|| "Failed to read client service config")? as usize;
+    let mut buf = vec![0u8; n];
+    conn.read_exact(&mut buf)
+        .await
+        .with_context(|| "Failed to read client service config")?;
+    
+    let config: ClientServiceConfig = toml::from_str(&String::from_utf8(buf)?[..]).with_context(|| "Failed to parse the config")?;
+    Ok(
+        ServerServiceConfig{
+            bind_addr: match config.recommend_bind_addr {
+                Some(bind_addr) => bind_addr,
+                None => return Err(anyhow::anyhow!(format!("Expect 'recommend_bind_addr' in {}", config.name))),
+            },
+            service_type: config.service_type,
+            name: config.name,
+            nodelay: config.nodelay, 
+            token: config.token,
+        }
+    )
 }
 
 pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Auth> {

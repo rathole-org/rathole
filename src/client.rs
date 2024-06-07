@@ -442,11 +442,21 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         // Read ack
         debug!("Reading ack");
-        match read_ack(&mut conn).await? {
-            Ack::Ok => {}
-            v => {
-                return Err(anyhow!("{}", v))
-                    .with_context(|| format!("Authentication failed: {}", self.service.name));
+        for _ in 0..2 {
+            match read_ack(&mut conn).await? {
+                Ack::Ok => break,
+                Ack::RequireServiceConfig => {
+                    debug!("Sending client service config");
+                    let s = toml::to_string(&self.service).unwrap();
+                    let buf = s.as_bytes();
+                    conn.write_u32(buf.len() as u32).await?;
+                    conn.write_all(buf).await?;
+                    conn.flush().await?;
+                }
+                v => {
+                    return Err(anyhow!("{}", v))
+                        .with_context(|| format!("Authentication failed: {}", self.service.name));
+                }
             }
         }
 

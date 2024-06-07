@@ -63,6 +63,7 @@ pub struct ClientServiceConfig {
     #[serde(skip)]
     pub name: String,
     pub local_addr: String,
+    pub recommend_bind_addr: Option<String>, 
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
@@ -214,11 +215,17 @@ fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
+fn default_accept_client_recommend_service() -> bool {
+    false
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind_addr: String,
     pub default_token: Option<MaskedString>,
+    #[serde(default = "default_accept_client_recommend_service")]
+    pub accept_client_recommend_service: bool,
     pub services: HashMap<String, ServerServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,

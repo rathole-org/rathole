@@ -102,6 +102,7 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
+    pub enable_proxy_protocol: Option<bool>,
 }
 
 impl ServerServiceConfig {

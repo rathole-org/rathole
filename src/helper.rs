@@ -164,3 +164,18 @@ where
     conn.flush().await.with_context(|| "Failed to flush data")?;
     Ok(())
 }
+
+pub fn generate_proxy_protocol_v1_header(s: &TcpStream) -> Result<String> {
+    let local_addr = s.local_addr()?;
+    let remote_addr = s.peer_addr()?;
+    let proto = if local_addr.is_ipv4() { "TCP4" } else { "TCP6" };
+    let header = format!(
+        "PROXY {} {} {} {} {}\r\n", 
+        proto, 
+        remote_addr.ip(), 
+        local_addr.ip(), 
+        remote_addr.port(), 
+        local_addr.port()
+    );
+    Ok(header)
+}

@@ -164,7 +164,7 @@ jobs:
         uses: docker/build-push-action@v2
         with:
           push: true
-          platforms: "linux/amd64,linux/arm64,linux/armhf"
+          platforms: linux/amd64, linux/arm64, linux/armhf, linux/armv7
           tags: rapiz1/rathole:latest, rapiz1/rathole:${{ github.ref_name }}
   publish-crate:
     name: Publish to crates.io

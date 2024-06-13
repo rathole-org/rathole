@@ -32,7 +32,9 @@ jobs:
       - name: Setup cargo-hack
         run: cargo install cargo-hack
       - name: Check all features
-        run: cargo hack check --feature-powerset --no-dev-deps
+        run: >
+          cargo hack check --feature-powerset --no-dev-deps
+          --mutually-exclusive-features default,native-tls,websocket-native-tls,rustls,websocket-rustls
 
   build:
     name: Build for ${{ matrix.target }}
@@ -62,8 +64,10 @@ jobs:
       - uses: Swatinem/rust-cache@v1
       - name: Build
         run: cargo build
-      - name: Run tests
+      - name: Run tests with native-tls
         run: cargo test --verbose
+      - name: Run tests with rustls
+        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
       - uses: actions/upload-artifact@v2
         with:
           name: rathole-${{ matrix.target }}

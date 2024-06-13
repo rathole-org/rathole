@@ -28,3 +28,4 @@ If you encountered a panic, please re-run with `RUST_BACKTRACE=1` to provide the
  - OS: <!-- Please fill in distribution if you're using linux-->
 - `rathole --version` output: 
 - CPU architecture:
+- rustc version:

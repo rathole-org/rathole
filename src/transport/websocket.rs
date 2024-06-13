@@ -13,10 +13,14 @@ use futures_core::stream::Stream;
 use futures_sink::Sink;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio_native_tls::TlsStream;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{accept_async_with_config, client_async_with_config};
-use tokio_tungstenite::{tungstenite::protocol::Message, WebSocketStream};
+
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+use super::tls::get_tcpstream;
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+use super::tls::TlsStream;
+
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebSocketStream};
 use tokio_util::io::StreamReader;
 use url::Url;
 
@@ -30,7 +34,7 @@ impl TransportStream {
     fn get_tcpstream(&self) -> &TcpStream {
         match self {
             TransportStream::Insecure(s) => s,
-            TransportStream::Secure(s) => s.get_ref().get_ref().get_ref(),
+            TransportStream::Secure(s) => get_tcpstream(s),
         }
     }
 }

@@ -1,8 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
 use backoff::{backoff::Backoff, Notify};
 use socket2::{SockRef, TcpKeepalive};
 use std::{future::Future, net::SocketAddr, time::Duration};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::{
     net::{lookup_host, TcpStream, ToSocketAddrs, UdpSocket},
     sync::broadcast,
@@ -39,6 +40,14 @@ pub fn feature_not_compile(feature: &str) -> ! {
     panic!(
         "The feature '{}' is not compiled in this binary. Please re-compile rathole",
         feature
+    )
+}
+
+#[allow(dead_code)]
+pub fn feature_neither_compile(feature1: &str, feature2: &str) -> ! {
+    panic!(
+        "Neither of the feature '{}' or '{}' is compiled in this binary. Please re-compile rathole",
+        feature1, feature2
     )
 }
 
@@ -143,4 +152,15 @@ where
             Err(anyhow!("shutdown"))
         }
     }
+}
+
+pub async fn write_and_flush<T>(conn: &mut T, data: &[u8]) -> Result<()>
+where
+    T: AsyncWrite + Unpin,
+{
+    conn.write_all(data)
+        .await
+        .with_context(|| "Failed to write data")?;
+    conn.flush().await.with_context(|| "Failed to flush data")?;
+    Ok(())
 }

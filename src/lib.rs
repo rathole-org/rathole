@@ -14,6 +14,7 @@ pub use constants::UDP_BUFFER_SIZE;
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 #[cfg(feature = "client")]
@@ -59,7 +60,7 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
     crate::helper::feature_not_compile("nosie")
 }
 
-pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
+pub async fn run(args: Cli, cancel: CancellationToken) -> Result<()> {
     if args.genkey.is_some() {
         return genkey(args.genkey.unwrap());
     }
@@ -69,10 +70,9 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
 
     // Spawn a config watcher. The watcher will send a initial signal to start the instance with a config
     let config_path = args.config_path.as_ref().unwrap();
-    let mut cfg_watcher = ConfigWatcherHandle::new(config_path, shutdown_rx).await?;
+    let mut cfg_watcher = ConfigWatcherHandle::new(config_path, cancel).await?;
 
-    // shutdown_tx owns the instance
-    let (shutdown_tx, _) = broadcast::channel(1);
+    let local_cancel_tx = CancellationToken::new();
 
     // (The join handle of the last instance, The service update channel sender)
     let mut last_instance: Option<(tokio::task::JoinHandle<_>, mpsc::Sender<ConfigChange>)> = None;
@@ -82,7 +82,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
             ConfigChange::General(config) => {
                 if let Some((i, _)) = last_instance {
                     info!("General configuration change detected. Restarting...");
-                    shutdown_tx.send(true)?;
+                    local_cancel_tx.cancel();
                     i.await??;
                 }
 
@@ -94,7 +94,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                     tokio::spawn(run_instance(
                         *config,
                         args.clone(),
-                        shutdown_tx.subscribe(),
+                        local_cancel_tx.clone(),
                         service_update_rx,
                     )),
                     service_update_tx,
@@ -109,7 +109,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
         }
     }
 
-    let _ = shutdown_tx.send(true);
+    local_cancel_tx.cancel();
 
     Ok(())
 }
@@ -117,7 +117,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
 async fn run_instance(
     config: Config,
     args: Cli,
-    shutdown_rx: broadcast::Receiver<bool>,
+    cancel: CancellationToken,
     service_update: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     match determine_run_mode(&config, &args) {
@@ -126,13 +126,13 @@ async fn run_instance(
             #[cfg(not(feature = "client"))]
             crate::helper::feature_not_compile("client");
             #[cfg(feature = "client")]
-            run_client(config, shutdown_rx, service_update).await
+            run_client(config, cancel, service_update).await
         }
         RunMode::Server => {
             #[cfg(not(feature = "server"))]
             crate::helper::feature_not_compile("server");
             #[cfg(feature = "server")]
-            run_server(config, shutdown_rx, service_update).await
+            run_server(config, cancel, service_update).await
         }
     }
 }

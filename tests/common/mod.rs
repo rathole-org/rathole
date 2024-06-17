@@ -4,15 +4,15 @@ use anyhow::Result;
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    sync::broadcast,
 };
+use tokio_util::sync::CancellationToken;
 
 pub const PING: &str = "ping";
 pub const PONG: &str = "pong";
 
 pub async fn run_rathole_server(
     config_path: &str,
-    shutdown_rx: broadcast::Receiver<bool>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let cli = rathole::Cli {
         config_path: Some(PathBuf::from(config_path)),
@@ -20,12 +20,12 @@ pub async fn run_rathole_server(
         client: false,
         ..Default::default()
     };
-    rathole::run(cli, shutdown_rx).await
+    rathole::run(cli, cancel).await
 }
 
 pub async fn run_rathole_client(
     config_path: &str,
-    shutdown_rx: broadcast::Receiver<bool>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let cli = rathole::Cli {
         config_path: Some(PathBuf::from(config_path)),
@@ -33,7 +33,7 @@ pub async fn run_rathole_client(
         client: true,
         ..Default::default()
     };
-    rathole::run(cli, shutdown_rx).await
+    rathole::run(cli, cancel).await
 }
 
 pub mod tcp {

@@ -14,6 +14,7 @@ use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 
 use rand::RngCore;
+use tokio_util::sync::CancellationToken;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,7 +42,7 @@ const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 // The entrypoint of running a server
 pub async fn run_server(
     config: Config,
-    shutdown_rx: broadcast::Receiver<bool>,
+    cancel: CancellationToken,
     update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     let config = match config.server {
@@ -54,13 +55,13 @@ pub async fn run_server(
     match config.transport.transport_type {
         TransportType::Tcp => {
             let mut server = Server::<TcpTransport>::from(config).await?;
-            server.run(shutdown_rx, update_rx).await?;
+            server.run(cancel, update_rx).await?;
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
                 let mut server = Server::<TlsTransport>::from(config).await?;
-                server.run(shutdown_rx, update_rx).await?;
+                server.run(cancel, update_rx).await?;
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
             crate::helper::feature_neither_compile("native-tls", "rustls")
@@ -69,7 +70,7 @@ pub async fn run_server(
             #[cfg(feature = "noise")]
             {
                 let mut server = Server::<NoiseTransport>::from(config).await?;
-                server.run(shutdown_rx, update_rx).await?;
+                server.run(cancel, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
             crate::helper::feature_not_compile("noise")
@@ -78,7 +79,7 @@ pub async fn run_server(
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
                 let mut server = Server::<WebsocketTransport>::from(config).await?;
-                server.run(shutdown_rx, update_rx).await?;
+                server.run(cancel, update_rx).await?;
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
             crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
@@ -134,7 +135,7 @@ impl<T: 'static + Transport> Server<T> {
     // The entry point of Server
     pub async fn run(
         &mut self,
-        mut shutdown_rx: broadcast::Receiver<bool>,
+        cancel: CancellationToken,
         mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
         // Listen at `server.bind_addr`
@@ -205,7 +206,7 @@ impl<T: 'static + Transport> Server<T> {
                     }
                 },
                 // Wait for the shutdown signal
-                _ = shutdown_rx.recv() => {
+                _ = cancel.cancelled() => {
                     info!("Shuting down gracefully...");
                     break;
                 },

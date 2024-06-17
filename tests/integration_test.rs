@@ -1,11 +1,11 @@
 use anyhow::{Ok, Result};
 use common::{run_rathole_client, PING, PONG};
 use rand::Rng;
+use tokio_util::sync::CancellationToken;
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
-    sync::broadcast,
     time,
 };
 use tracing::{debug, info, instrument};
@@ -117,13 +117,13 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
         return Ok(());
     }
 
-    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
-    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let (cancel_client_tx, cancel_server_tx) = (CancellationToken::new(), CancellationToken::new());
 
     // Start the client
     info!("start the client");
+    let cancel_client_rx = cancel_client_tx.clone();
     let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
+        run_rathole_client(config_path, cancel_client_rx)
             .await
             .unwrap();
     });
@@ -133,8 +133,9 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
     // Start the server
     info!("start the server");
+    let cancel_server_rx = cancel_server_tx.clone();
     let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
+        run_rathole_server(config_path, cancel_server_rx)
             .await
             .unwrap();
     });
@@ -149,13 +150,14 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
     // Simulate the client crash and restart
     info!("shutdown the client");
-    client_shutdown_tx.send(true)?;
+    cancel_client_tx.cancel();
     let _ = tokio::join!(client);
 
     info!("restart the client");
-    let client_shutdown_rx = client_shutdown_tx.subscribe();
+    let restart_client_cancel_tx = CancellationToken::new();
+    let restart_client_cancel_rx = restart_client_cancel_tx.clone();
     let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
+        run_rathole_client(config_path, restart_client_cancel_rx)
             .await
             .unwrap();
     });
@@ -170,13 +172,14 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
     // Simulate the server crash and restart
     info!("shutdown the server");
-    server_shutdown_tx.send(true)?;
+    cancel_server_tx.cancel();
     let _ = tokio::join!(server);
 
     info!("restart the server");
-    let server_shutdown_rx = server_shutdown_tx.subscribe();
+    let restart_server_cancel_tx = CancellationToken::new();
+    let restart_server_cancel_rx = restart_server_cancel_tx.clone();
     let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
+        run_rathole_server(config_path, restart_server_cancel_rx)
             .await
             .unwrap();
     });
@@ -205,8 +208,8 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
     // Shutdown
     info!("shutdown the server and the client");
-    server_shutdown_tx.send(true)?;
-    client_shutdown_tx.send(true)?;
+    restart_client_cancel_tx.cancel();
+    restart_server_cancel_tx.cancel();
 
     let _ = tokio::join!(server, client);
 

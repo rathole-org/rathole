@@ -19,6 +19,7 @@ use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
 #[cfg(feature = "noise")]
@@ -33,7 +34,7 @@ use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE
 // The entrypoint of running a client
 pub async fn run_client(
     config: Config,
-    shutdown_rx: broadcast::Receiver<bool>,
+    cancel: CancellationToken,
     update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     let config = config.client.ok_or_else(|| {
@@ -45,13 +46,13 @@ pub async fn run_client(
     match config.transport.transport_type {
         TransportType::Tcp => {
             let mut client = Client::<TcpTransport>::from(config).await?;
-            client.run(shutdown_rx, update_rx).await
+            client.run(cancel, update_rx).await
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
                 let mut client = Client::<TlsTransport>::from(config).await?;
-                client.run(shutdown_rx, update_rx).await
+                client.run(cancel, update_rx).await
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
             crate::helper::feature_neither_compile("native-tls", "rustls")
@@ -60,7 +61,7 @@ pub async fn run_client(
             #[cfg(feature = "noise")]
             {
                 let mut client = Client::<NoiseTransport>::from(config).await?;
-                client.run(shutdown_rx, update_rx).await
+                client.run(cancel, update_rx).await
             }
             #[cfg(not(feature = "noise"))]
             crate::helper::feature_not_compile("noise")
@@ -69,7 +70,7 @@ pub async fn run_client(
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
                 let mut client = Client::<WebsocketTransport>::from(config).await?;
-                client.run(shutdown_rx, update_rx).await
+                client.run(cancel, update_rx).await
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
             crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
@@ -102,7 +103,7 @@ impl<T: 'static + Transport> Client<T> {
     // The entrypoint of Client
     async fn run(
         &mut self,
-        mut shutdown_rx: broadcast::Receiver<bool>,
+        cancel: CancellationToken,
         mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
         for (name, config) in &self.config.services {
@@ -119,13 +120,7 @@ impl<T: 'static + Transport> Client<T> {
         // Wait for the shutdown signal
         loop {
             tokio::select! {
-                val = shutdown_rx.recv() => {
-                    match val {
-                        Ok(_) => {}
-                        Err(err) => {
-                            error!("Unable to listen for shutdown signal: {}", err);
-                        }
-                    }
+                _ = cancel.cancelled() => {
                     break;
                 },
                 e = update_rx.recv() => {

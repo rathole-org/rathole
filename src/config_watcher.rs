@@ -3,12 +3,13 @@ use crate::{
     Config,
 };
 use anyhow::{Context, Result};
+use tokio_util::sync::CancellationToken;
 use std::{
     collections::HashMap,
     env,
     path::{Path, PathBuf},
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tracing::{error, info, instrument};
 
 #[cfg(feature = "notify")]
@@ -98,7 +99,7 @@ pub struct ConfigWatcherHandle {
 }
 
 impl ConfigWatcherHandle {
-    pub async fn new(path: &Path, shutdown_rx: broadcast::Receiver<bool>) -> Result<Self> {
+    pub async fn new(path: &Path, cancel: CancellationToken) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let origin_cfg = Config::from_file(path).await?;
 
@@ -109,7 +110,7 @@ impl ConfigWatcherHandle {
 
         tokio::spawn(config_watcher(
             path.to_owned(),
-            shutdown_rx,
+            cancel,
             event_tx,
             origin_cfg,
         ));
@@ -132,10 +133,10 @@ async fn config_watcher(
 }
 
 #[cfg(feature = "notify")]
-#[instrument(skip(shutdown_rx, event_tx, old))]
+#[instrument(skip(cancel, event_tx, old))]
 async fn config_watcher(
     path: PathBuf,
-    mut shutdown_rx: broadcast::Receiver<bool>,
+    cancel: CancellationToken,
     event_tx: mpsc::UnboundedSender<ConfigChange>,
     mut old: Config,
 ) -> Result<()> {
@@ -190,7 +191,7 @@ async fn config_watcher(
               None => break
             }
           },
-          _ = shutdown_rx.recv() => break
+          _ = cancel.cancelled() => break
         }
     }
 

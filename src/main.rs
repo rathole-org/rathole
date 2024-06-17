@@ -1,25 +1,23 @@
 use anyhow::Result;
 use clap::Parser;
 use rathole::{run, Cli};
-use tokio::{signal, sync::broadcast};
+use tokio::signal;
 use tracing_subscriber::EnvFilter;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
 
-    let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
+    let cancel_tx = CancellationToken::new();
+    let cancel_rx = cancel_tx.clone();
     tokio::spawn(async move {
         if let Err(e) = signal::ctrl_c().await {
             // Something really weird happened. So just panic
             panic!("Failed to listen for the ctrl-c signal: {:?}", e);
         }
 
-        if let Err(e) = shutdown_tx.send(true) {
-            // shutdown signal must be catched and handle properly
-            // `rx` must not be dropped
-            panic!("Failed to send shutdown signal: {:?}", e);
-        }
+        cancel_tx.cancel(); // synchronously
     });
 
     #[cfg(feature = "console")]
@@ -41,5 +39,5 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    run(args, shutdown_rx).await
+    run(args, cancel_rx).await
 }

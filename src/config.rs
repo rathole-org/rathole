@@ -255,9 +255,9 @@ impl Config {
     fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
         // Validate services
         for (name, s) in &mut server.services {
-            s.name = name.clone();
+            s.name.clone_from(name);
             if s.token.is_none() {
-                s.token = server.default_token.clone();
+                s.token.clone_from(&server.default_token);
                 if s.token.is_none() {
                     bail!("The token of service {} is not set", name);
                 }
@@ -272,9 +272,9 @@ impl Config {
     fn validate_client_config(client: &mut ClientConfig) -> Result<()> {
         // Validate services
         for (name, s) in &mut client.services {
-            s.name = name.clone();
+            s.name.clone_from(name);
             if s.token.is_none() {
-                s.token = client.default_token.clone();
+                s.token.clone_from(&client.default_token);
                 if s.token.is_none() {
                     bail!("The token of service {} is not set", name);
                 }

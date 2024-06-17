@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};

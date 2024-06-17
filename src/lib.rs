@@ -13,7 +13,7 @@ pub use config::Config;
 pub use constants::UDP_BUFFER_SIZE;
 
 use anyhow::Result;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 

@@ -136,3 +136,6 @@ vergen = { version = "7.4.2", default-features = false, features = [
     "cargo",
 ] }
 anyhow = "1.0"
+
+[dev-dependencies]
+serial_test = "3.1.1"

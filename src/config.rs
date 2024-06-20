@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::Path;
@@ -64,6 +65,7 @@ pub struct ClientServiceConfig {
     pub name: String,
     pub local_addr: String,
     pub token: Option<MaskedString>,
+    pub token_file: Option<String>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
 }
@@ -101,6 +103,7 @@ pub struct ServerServiceConfig {
     pub name: String,
     pub bind_addr: String,
     pub token: Option<MaskedString>,
+    pub token_file: Option<String>,
     pub nodelay: Option<bool>,
 }
 
@@ -201,6 +204,7 @@ fn default_client_retry_interval() -> u64 {
 pub struct ClientConfig {
     pub remote_addr: String,
     pub default_token: Option<MaskedString>,
+    pub default_token_file: Option<String>,
     pub services: HashMap<String, ClientServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
@@ -219,6 +223,7 @@ fn default_heartbeat_interval() -> u64 {
 pub struct ServerConfig {
     pub bind_addr: String,
     pub default_token: Option<MaskedString>,
+    pub default_token_file: Option<String>,
     pub services: HashMap<String, ServerServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
@@ -234,15 +239,15 @@ pub struct Config {
 }
 
 impl Config {
-    fn from_str(s: &str) -> Result<Config> {
+    async fn from_str(s: &str) -> Result<Config> {
         let mut config: Config = toml::from_str(s).with_context(|| "Failed to parse the config")?;
 
         if let Some(server) = config.server.as_mut() {
-            Config::validate_server_config(server)?;
+            Config::validate_server_config(server).await?;
         }
 
         if let Some(client) = config.client.as_mut() {
-            Config::validate_client_config(client)?;
+            Config::validate_client_config(client).await?;
         }
 
         if config.server.is_none() && config.client.is_none() {
@@ -252,15 +257,48 @@ impl Config {
         }
     }
 
-    fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
+    async fn parse_token(
+        name: &str,
+        token: &Option<MaskedString>,
+        token_file: &Option<String>,
+        default_token: &Option<MaskedString>,
+    ) -> Option<MaskedString> {
+        if token.is_some() {
+            return token.clone();
+        }
+
+        if let Some(v) = token_file {
+            return fs::read_to_string(v).await.ok().map(MaskedString);
+        }
+
+        if let Ok(v) = env::var(format!("RATHOLE_{}_TOKEN", name.to_uppercase())) {
+            return Some(MaskedString(v));
+        }
+
+        if default_token.is_some() {
+            return default_token.clone();
+        }
+
+        None
+    }
+
+    async fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
+        let default_token = Self::parse_token(
+            "default",
+            &server.default_token,
+            &server.default_token_file,
+            &None,
+        )
+        .await;
+
         // Validate services
         for (name, s) in &mut server.services {
-            s.name = name.clone();
+            s.name.clone_from(name);
+            s.token =
+                Self::parse_token(name.as_str(), &s.token, &s.token_file, &default_token).await;
+
             if s.token.is_none() {
-                s.token = server.default_token.clone();
-                if s.token.is_none() {
-                    bail!("The token of service {} is not set", name);
-                }
+                bail!("The token of service {} is not set", name);
             }
         }
 
@@ -269,15 +307,23 @@ impl Config {
         Ok(())
     }
 
-    fn validate_client_config(client: &mut ClientConfig) -> Result<()> {
+    async fn validate_client_config(client: &mut ClientConfig) -> Result<()> {
+        let default_token = Self::parse_token(
+            "default",
+            &client.default_token,
+            &client.default_token_file,
+            &None,
+        )
+        .await;
+
         // Validate services
         for (name, s) in &mut client.services {
-            s.name = name.clone();
+            s.name.clone_from(name);
+            s.token =
+                Self::parse_token(name.as_str(), &s.token, &s.token_file, &default_token).await;
+
             if s.token.is_none() {
-                s.token = client.default_token.clone();
-                if s.token.is_none() {
-                    bail!("The token of service {} is not set", name);
-                }
+                bail!("The token of service {} is not set", name);
             }
             if s.retry_interval.is_none() {
                 s.retry_interval = Some(client.retry_interval);
@@ -327,7 +373,7 @@ impl Config {
         let s: String = fs::read_to_string(path)
             .await
             .with_context(|| format!("Failed to read the config {:?}", path))?;
-        Config::from_str(&s).with_context(|| {
+        Config::from_str(&s).await.with_context(|| {
             "Configuration is invalid. Please refer to the configuration specification."
         })
     }
@@ -336,9 +382,12 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf};
+    use std::fs;
+    use std::path::PathBuf;
 
     use anyhow::Result;
+    use serial_test::{parallel, serial};
+    use tokio::runtime::Runtime;
 
     fn list_config_files<T: AsRef<Path>>(root: T) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
@@ -361,38 +410,42 @@ mod tests {
             .collect())
     }
 
-    #[test]
-    fn test_example_config() -> Result<()> {
+    #[tokio::test]
+    #[parallel]
+    async fn test_example_config() -> Result<()> {
         let paths = get_all_example_config()?;
         for p in paths {
             let s = fs::read_to_string(p)?;
-            Config::from_str(&s)?;
+            Config::from_str(&s).await?;
         }
         Ok(())
     }
 
-    #[test]
-    fn test_valid_config() -> Result<()> {
+    #[tokio::test]
+    #[parallel]
+    async fn test_valid_config() -> Result<()> {
         let paths = list_config_files("tests/config_test/valid_config")?;
         for p in paths {
             let s = fs::read_to_string(p)?;
-            Config::from_str(&s)?;
+            Config::from_str(&s).await?;
         }
         Ok(())
     }
 
-    #[test]
-    fn test_invalid_config() -> Result<()> {
+    #[tokio::test]
+    #[parallel]
+    async fn test_invalid_config() -> Result<()> {
         let paths = list_config_files("tests/config_test/invalid_config")?;
         for p in paths {
             let s = fs::read_to_string(p)?;
-            assert!(Config::from_str(&s).is_err());
+            assert!(Config::from_str(&s).await.is_err());
         }
         Ok(())
     }
 
-    #[test]
-    fn test_validate_server_config() -> Result<()> {
+    #[tokio::test]
+    #[parallel]
+    async fn test_validate_server_config() -> Result<()> {
         let mut cfg = ServerConfig::default();
 
         cfg.services.insert(
@@ -407,11 +460,11 @@ mod tests {
         );
 
         // Missing the token
-        assert!(Config::validate_server_config(&mut cfg).is_err());
+        assert!(Config::validate_server_config(&mut cfg).await.is_err());
 
         // Use the default token
         cfg.default_token = Some("123".into());
-        assert!(Config::validate_server_config(&mut cfg).is_ok());
+        assert!(Config::validate_server_config(&mut cfg).await.is_ok());
         assert_eq!(
             cfg.services
                 .get("foo1")
@@ -426,7 +479,7 @@ mod tests {
 
         // The default token won't override the service token
         cfg.services.get_mut("foo1").unwrap().token = Some("4".into());
-        assert!(Config::validate_server_config(&mut cfg).is_ok());
+        assert!(Config::validate_server_config(&mut cfg).await.is_ok());
         assert_eq!(
             cfg.services
                 .get("foo1")
@@ -441,8 +494,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_validate_client_config() -> Result<()> {
+    #[tokio::test]
+    #[parallel]
+    async fn test_validate_client_config() -> Result<()> {
         let mut cfg = ClientConfig::default();
 
         cfg.services.insert(
@@ -457,11 +511,12 @@ mod tests {
         );
 
         // Missing the token
-        assert!(Config::validate_client_config(&mut cfg).is_err());
+        println!("{:?}", env::var("DEFAULT_TOKEN").ok());
+        assert!(Config::validate_client_config(&mut cfg).await.is_err());
 
         // Use the default token
         cfg.default_token = Some("123".into());
-        assert!(Config::validate_client_config(&mut cfg).is_ok());
+        assert!(Config::validate_client_config(&mut cfg).await.is_ok());
         assert_eq!(
             cfg.services
                 .get("foo1")
@@ -476,7 +531,7 @@ mod tests {
 
         // The default token won't override the service token
         cfg.services.get_mut("foo1").unwrap().token = Some("4".into());
-        assert!(Config::validate_client_config(&mut cfg).is_ok());
+        assert!(Config::validate_client_config(&mut cfg).await.is_ok());
         assert_eq!(
             cfg.services
                 .get("foo1")
@@ -489,5 +544,43 @@ mod tests {
             "4"
         );
         Ok(())
+    }
+
+    #[serial(env_default_token)]
+    fn read_from_env_var() {
+        let mut cfg = ClientConfig::default();
+
+        cfg.services.insert(
+            "foo1".into(),
+            ClientServiceConfig {
+                service_type: ServiceType::Tcp,
+                name: "foo1".into(),
+                local_addr: "127.0.0.1:80".into(),
+                token: None,
+                ..Default::default()
+            },
+        );
+
+        env::set_var("RATHOLE_DEFAULT_TOKEN", "test-token");
+
+        // Can't .await with tokio::test while env vars are set. There must be a block surrounding the futures.
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            Config::validate_client_config(&mut cfg).await.unwrap();
+        });
+        assert_eq!(
+            cfg.services
+                .get("foo1")
+                .as_ref()
+                .unwrap()
+                .token
+                .as_ref()
+                .unwrap()
+                .0
+                .as_str(),
+            "test-token"
+        );
+
+        env::remove_var("RATHOLE_DEFAULT_TOKEN");
     }
 }

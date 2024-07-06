@@ -64,16 +64,43 @@ pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
 }
 
 /// Create a UDP socket and connect to `addr`
-pub async fn udp_connect<A: ToSocketAddrs>(addr: A) -> Result<UdpSocket> {
-    let addr = to_socket_addr(addr).await?;
+pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result<UdpSocket> {
 
-    let bind_addr = match addr {
-        SocketAddr::V4(_) => "0.0.0.0:0",
-        SocketAddr::V6(_) => ":::0",
+    let (socket_addr, bind_addr);
+
+    match prefer_ipv6 {
+        false => {
+            socket_addr = to_socket_addr(addr).await?;
+
+            bind_addr = match socket_addr {
+                SocketAddr::V4(_) => "0.0.0.0:0",
+                SocketAddr::V6(_) => ":::0",
+            };
+        },
+        true => {
+            let all_host_addresses: Vec<SocketAddr> = lookup_host(addr).await?.collect();
+
+            // Try to find an IPv6 address
+            match all_host_addresses.clone().iter().find(|x| x.is_ipv6()) {
+                Some(socket_addr_ipv6) => {
+                    socket_addr = socket_addr_ipv6.clone();
+                    bind_addr = ":::0";
+                },
+                None => {
+                    let socket_addr_ipv4 = all_host_addresses.iter().find(|x| x.is_ipv4());
+                    match socket_addr_ipv4 {
+                        None => return Err(anyhow!("Failed to lookup the host")),
+                        Some(socket_addr_ipv4) => {
+                            socket_addr = socket_addr_ipv4.clone();
+                            bind_addr = "0.0.0.0:0";
+                        }
+                    }
+                }
+            }
+        }
     };
-
     let s = UdpSocket::bind(bind_addr).await?;
-    s.connect(addr).await?;
+    s.connect(socket_addr).await?;
     Ok(s)
 }
 

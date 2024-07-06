@@ -1,7 +1,6 @@
 [client]
 remote_addr = "example.com:2333" # Necessary. The address of the server
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
-prefer_ipv6 = false # Optional. If the client prefers to use IPv6 when connecting to the server (e.g.: When the client is behind an ISP's NAT). Default: false
 
 [client.transport]
 type = "tcp" # Optional. Possible values: ["tcp", "tls"]. Default: "tcp"
@@ -18,6 +17,7 @@ remote_public_key = "key_encoded_in_base64" # Optional
 [client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
 type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
 token = "whatever" # Necessary if `client.default_token` not set
+prefer_ipv6 = false # Optional. If the client prefers to use IPv6 when connecting to the server (e.g.: When the client is behind an ISP's NAT). Default: false
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
 
 [client.services.service2] # Multiple services can be defined

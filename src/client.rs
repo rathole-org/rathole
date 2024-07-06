@@ -110,7 +110,6 @@ impl<T: 'static + Transport> Client<T> {
             let handle = ControlChannelHandle::new(
                 (*config).clone(),
                 self.config.remote_addr.clone(),
-                self.config.prefer_ipv6,
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
             );
@@ -153,7 +152,6 @@ impl<T: 'static + Transport> Client<T> {
                     let handle = ControlChannelHandle::new(
                         cfg,
                         self.config.remote_addr.clone(),
-                        self.config.prefer_ipv6,
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
                     );
@@ -392,7 +390,6 @@ struct ControlChannel<T: Transport> {
     service: ClientServiceConfig,       // `[client.services.foo]` config block
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
     remote_addr: String,                // `client.remote_addr`
-    prefer_ipv6: Option<bool>,
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
 }
@@ -502,7 +499,6 @@ impl ControlChannelHandle {
     fn new<T: 'static + Transport>(
         service: ClientServiceConfig,
         remote_addr: String,
-        prefer_ipv6: Option<bool>,
         transport: Arc<T>,
         heartbeat_timeout: u64,
     ) -> ControlChannelHandle {
@@ -518,7 +514,6 @@ impl ControlChannelHandle {
             service,
             shutdown_rx,
             remote_addr,
-            prefer_ipv6,
             transport,
             heartbeat_timeout,
         };

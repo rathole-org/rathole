@@ -83,7 +83,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
             // Try to find an IPv6 address
             match all_host_addresses.clone().iter().find(|x| x.is_ipv6()) {
                 Some(socket_addr_ipv6) => {
-                    socket_addr = socket_addr_ipv6.clone();
+                    socket_addr = *socket_addr_ipv6;
                     bind_addr = ":::0";
                 },
                 None => {
@@ -92,7 +92,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                         None => return Err(anyhow!("Failed to lookup the host")),
                         // fallback to IPv4
                         Some(socket_addr_ipv4) => {
-                            socket_addr = socket_addr_ipv4.clone();
+                            socket_addr = *socket_addr_ipv4;
                             bind_addr = "0.0.0.0:0";
                         }
                     }

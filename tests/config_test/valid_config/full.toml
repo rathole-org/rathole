@@ -1,6 +1,7 @@
 [client]
 remote_addr = "example.com:2333" # Necessary. The address of the server
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
+prefer_ipv6 = false # Optional. If the client prefers to use IPv6 when connecting to the server (e.g.: When the client is behind an ISP's NAT). Default: false
 
 [client.transport]
 type = "tcp" # Optional. Possible values: ["tcp", "tls"]. Default: "tcp"

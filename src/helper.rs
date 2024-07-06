@@ -90,6 +90,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                     let socket_addr_ipv4 = all_host_addresses.iter().find(|x| x.is_ipv4());
                     match socket_addr_ipv4 {
                         None => return Err(anyhow!("Failed to lookup the host")),
+                        // fallback to IPv4
                         Some(socket_addr_ipv4) => {
                             socket_addr = socket_addr_ipv4.clone();
                             bind_addr = "0.0.0.0:0";

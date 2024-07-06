@@ -110,6 +110,7 @@ impl<T: 'static + Transport> Client<T> {
             let handle = ControlChannelHandle::new(
                 (*config).clone(),
                 self.config.remote_addr.clone(),
+                self.config.prefer_ipv6,
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
             );
@@ -152,6 +153,7 @@ impl<T: 'static + Transport> Client<T> {
                     let handle = ControlChannelHandle::new(
                         cfg,
                         self.config.remote_addr.clone(),
+                        self.config.prefer_ipv6,
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
                     );
@@ -227,7 +229,7 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
         }
     }
     Ok(())
@@ -255,7 +257,7 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -305,7 +307,7 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
             // grabbing the writer lock
             let mut m = port_map.write().await;
 
-            match udp_connect(local_addr).await {
+            match udp_connect(local_addr, prefer_ipv6).await {
                 Ok(s) => {
                     let (inbound_tx, inbound_rx) = mpsc::channel(UDP_SENDQ_SIZE);
                     m.insert(packet.from, inbound_tx);
@@ -390,6 +392,7 @@ struct ControlChannel<T: Transport> {
     service: ClientServiceConfig,       // `[client.services.foo]` config block
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
     remote_addr: String,                // `client.remote_addr`
+    prefer_ipv6: Option<bool>,
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
 }
@@ -499,6 +502,7 @@ impl ControlChannelHandle {
     fn new<T: 'static + Transport>(
         service: ClientServiceConfig,
         remote_addr: String,
+        prefer_ipv6: Option<bool>,
         transport: Arc<T>,
         heartbeat_timeout: u64,
     ) -> ControlChannelHandle {
@@ -514,6 +518,7 @@ impl ControlChannelHandle {
             service,
             shutdown_rx,
             remote_addr,
+            prefer_ipv6,
             transport,
             heartbeat_timeout,
         };

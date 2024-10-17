@@ -51,6 +51,8 @@ pub enum TransportType {
     Noise,
     #[serde(rename = "websocket")]
     Websocket,
+    #[serde(rename = "http2")]
+    HTTP2,
 }
 
 /// Per service config
@@ -141,6 +143,12 @@ pub struct WebsocketConfig {
     pub tls: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HTTP2Config {
+    pub tls: bool,
+}
+
 fn default_nodelay() -> bool {
     DEFAULT_NODELAY
 }
@@ -186,6 +194,7 @@ pub struct TransportConfig {
     pub tls: Option<TlsConfig>,
     pub noise: Option<NoiseConfig>,
     pub websocket: Option<WebsocketConfig>,
+    pub http2: Option<HTTP2Config>,
 }
 
 fn default_heartbeat_timeout() -> u64 {
@@ -320,6 +329,7 @@ impl Config {
                 Ok(())
             }
             TransportType::Websocket => Ok(()),
+            TransportType::HTTP2 => Ok(()),
         }
     }
 

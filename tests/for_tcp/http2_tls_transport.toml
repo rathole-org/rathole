@@ -1,0 +1,33 @@
+[client]
+remote_addr = "127.0.0.1:2333" 
+default_token = "default_token_if_not_specify" 
+
+[client.transport]
+type = "http2" 
+[client.transport.tls]
+trusted_root = "examples/tls/rootCA.crt"
+hostname = "localhost"
+[client.transport.http2] 
+tls = true
+
+[client.services.echo] 
+local_addr = "127.0.0.1:8080" 
+[client.services.pingpong] 
+local_addr = "127.0.0.1:8081" 
+
+[server]
+bind_addr = "0.0.0.0:2333" 
+default_token = "default_token_if_not_specify" 
+
+[server.transport]
+type = "http2" 
+[server.transport.tls]
+pkcs12 = "examples/tls/identity.pfx"
+pkcs12_password = "1234"
+[server.transport.http2] 
+tls = true
+
+[server.services.echo] 
+bind_addr = "0.0.0.0:2334" 
+[server.services.pingpong] 
+bind_addr = "0.0.0.0:2335" 

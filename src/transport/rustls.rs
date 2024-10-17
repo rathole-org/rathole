@@ -151,6 +151,7 @@ impl Transport for TlsTransport {
     }
 }
 
+#[cfg(any(feature = "websocket-rustls", feature = "http2-rustls"))]
 pub(crate) fn get_tcpstream(s: &TlsStream<TcpStream>) -> &TcpStream {
     &s.get_ref().0
 }

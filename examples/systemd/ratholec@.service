@@ -13,5 +13,22 @@ ExecStart=/usr/bin/rathole -c /etc/rathole/%i.toml
 # without root
 # ExecStart=%h/.local/bin/rathole -c %h/.local/etc/rathole/%i.toml
 
+# Enhance Security
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
 [Install]
 WantedBy=multi-user.target

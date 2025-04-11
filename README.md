@@ -35,9 +35,27 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 - **Security** Tokens of services are mandatory and service-wise. The server and clients are responsible for their own configs. With the optional Noise Protocol, encryption can be configured at ease. No need to create a self-signed certificate! TLS is also supported.
 - **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file. HTTP API is WIP.
 
-## Quickstart
+## Installation
 
 A full-powered `rathole` can be obtained from the [release](https://github.com/rapiz1/rathole/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**. A [Docker image](https://hub.docker.com/r/rapiz1/rathole) is also available.
+
+Example:
+
+```bash
+#Replace {asset_name} with the correct file for your system.
+wget https://github.com/rapiz1/rathole/releases/latest/download/{asset_name}
+
+# Unpack the downloaded archive
+uzip {asset_name}
+
+# Move the binary to a directory in your system's PATH
+sudo mv rathole /usr/local/bin/
+
+# Verify installation
+rathole -V
+```
+
+## Quickstart
 
 The usage of `rathole` is very similar to frp. If you have experience with the latter, then the configuration is very easy for you. The only difference is that configuration of a service is split into the client side and the server side, and a token is mandatory.
 

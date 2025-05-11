@@ -68,7 +68,7 @@ jobs:
         run: cargo test --verbose
       - name: Run tests with rustls
         run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v4
         with:
           name: rathole-${{ matrix.target }}
           path: target/debug/${{ matrix.exe }}

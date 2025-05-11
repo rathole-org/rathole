@@ -164,3 +164,59 @@ where
     conn.flush().await.with_context(|| "Failed to flush data")?;
     Ok(())
 }
+
+pub fn generate_proxy_protocol_header(s: &TcpStream, proxy_protocol: &str) -> Result<Vec<u8>, anyhow::Error> {
+    let local_addr = s.local_addr()?;
+    let remote_addr = s.peer_addr()?;
+
+    match proxy_protocol {
+        "v1" => {
+            let proto = if local_addr.is_ipv4() { "TCP4" } else { "TCP6" };
+            let header = format!(
+                "PROXY {} {} {} {} {}\r\n", 
+                proto, 
+                remote_addr.ip(), 
+                local_addr.ip(), 
+                remote_addr.port(), 
+                local_addr.port()
+            );
+
+            Ok(header.into_bytes())
+        }
+        "v2" => {
+
+            let v2sig: &[u8] = &[0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A];
+            let ver_cmd = &[0x21]; // 0x21 version 2 and PROXY command
+            let proto = if local_addr.is_ipv4() { &[0x11] } else { &[0x21] }; // 0x11 for TCP IPv4 and 0x21 for TCP IPv6, TODO: support UNIX
+            let addrs_length: &[u8] = if local_addr.is_ipv4() { &[0, 12] } else { &[0, 36] }; // 12 for IPv4 and 36 for IPv6, TOOD: support UNIX
+            let src_addr = match remote_addr {
+                SocketAddr::V4(v4) => v4.ip().octets().to_vec(),
+                SocketAddr::V6(v6) => v6.ip().octets().to_vec(),
+            };
+            let dst_addr = match local_addr {
+                SocketAddr::V4(v4) => v4.ip().octets().to_vec(),
+                SocketAddr::V6(v6) => v6.ip().octets().to_vec(),
+            };
+    
+            let header:Vec<u8> = [
+                v2sig, 
+                ver_cmd, 
+                proto, 
+                addrs_length,
+                &src_addr,
+                &dst_addr,
+                &remote_addr.port().to_be_bytes(),
+                &local_addr.port().to_be_bytes()
+                ].concat();
+    
+            trace!("Proxy protocol v2 header: {:02x?}", header);
+    
+            Ok(header)
+
+        },
+        _ => {
+            Err(anyhow!("Unknown proxy protocol {}", proxy_protocol))
+        }
+    }
+
+}

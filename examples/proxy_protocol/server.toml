@@ -1,0 +1,12 @@
+# rathole configuration for proxy protocol enabled client
+# 
+# The service configuration has an additional `enable_proxy_protocol` boolean field.
+# Not setting this field defaults its value to `false` at runtime.
+
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "123"
+
+[server.services.foo1]
+bind_addr = "0.0.0.0:5202"
+proxy_protocol = "v2"

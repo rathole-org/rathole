@@ -65,10 +65,15 @@ async fn tcp() -> Result<()> {
 
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_tcp/websocket_transport.toml", Type::Tcp).await?;
-
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;
+
+    #[cfg(any(feature = "http2-native-tls", feature = "http2-rustls"))]
+    test("tests/for_tcp/http2_transport.toml", Type::Tcp).await?;
+    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(feature = "http2-native-tls", feature = "http2-rustls"))]
+    test("tests/for_tcp/http2_tls_transport.toml", Type::Tcp).await?;
 
     Ok(())
 }
@@ -102,10 +107,15 @@ async fn udp() -> Result<()> {
 
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_udp/websocket_transport.toml", Type::Udp).await?;
-
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
+
+    #[cfg(any(feature = "http2-native-tls", feature = "http2-rustls"))]
+    test("tests/for_udp/http2_transport.toml", Type::Udp).await?;
+    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(feature = "http2-native-tls", feature = "http2-rustls"))]
+    test("tests/for_udp/http2_tls_transport.toml", Type::Udp).await?;
 
     Ok(())
 }

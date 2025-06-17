@@ -23,6 +23,8 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
+#[cfg(any(feature = "http2-native-tls", feature = "http2-rustls"))]
+use crate::transport::HTTP2Transport;
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
@@ -82,6 +84,15 @@ pub async fn run_server(
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
             crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
+        }
+        TransportType::HTTP2 => {
+            #[cfg(any(feature = "http2-native-tls", feature = "http2-rustls"))]
+            {
+                let mut server = Server::<HTTP2Transport>::from(config).await?;
+                server.run(shutdown_rx, update_rx).await?;
+            }
+            #[cfg(not(any(feature = "http2-native-tls", feature = "http2-rustls")))]
+            crate::helper::feature_neither_compile("http2-native-tls", "http2-rustls")
         }
     }
 

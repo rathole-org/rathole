@@ -85,6 +85,14 @@ use rustls as tls;
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
 pub(crate) use tls::TlsTransport;
 
+#[cfg(any(
+    feature = "websocket-native-tls",
+    feature = "http2-native-tls",
+    feature = "websocket-rustls",
+    feature = "http2-rustls"
+))]
+mod maybe_tls;
+
 #[cfg(feature = "noise")]
 mod noise;
 #[cfg(feature = "noise")]
@@ -94,6 +102,11 @@ pub use noise::NoiseTransport;
 mod websocket;
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 pub use websocket::WebsocketTransport;
+
+#[cfg(any(feature = "http2-native-tls", feature = "http2-rustls"))]
+mod http2;
+#[cfg(any(feature = "http2-native-tls", feature = "http2-rustls"))]
+pub use http2::HTTP2Transport;
 
 #[derive(Debug, Clone, Copy)]
 struct Keepalive {

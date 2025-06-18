@@ -162,7 +162,7 @@ async fn config_watcher(
             Err(e) => error!("watch error: {:#}", e),
         })?;
 
-    watcher.watch(parent_path, RecursiveMode::NonRecursive)?;
+    watcher.watch(parent_path, RecursiveMode::Recursive)?;
     info!("Start watching the config");
 
     loop {

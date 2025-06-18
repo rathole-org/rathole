@@ -14,6 +14,7 @@ use backoff::ExponentialBackoff;
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::process::exit;
 use std::sync::Arc;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -508,6 +509,7 @@ impl ControlChannelHandle {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());
+        let max_retries = service.max_retries.unwrap_or(0);
 
         let mut s = ControlChannel {
             digest,
@@ -521,6 +523,7 @@ impl ControlChannelHandle {
         tokio::spawn(
             async move {
                 let mut start = Instant::now();
+                let mut retries = 0;
 
                 while let Err(err) = s
                     .run()
@@ -542,6 +545,13 @@ impl ControlChannelHandle {
                     } else {
                         // Should never reach
                         panic!("{:#}. Break", err);
+                    }
+
+                    retries += 1;
+
+                    if max_retries > 0 && retries >= max_retries {
+                        error!("Max retries reached. Exiting...");
+                        exit(1)
                     }
 
                     start = Instant::now();

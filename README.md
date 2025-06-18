@@ -109,6 +109,7 @@ remote_addr = "example.com:2333" # Necessary. The address of the server
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
 heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
+max_retries = 0 # Optional. The maximum number of retries to connect to the server. Set to 0 to retry forever. Default: 0
 
 [client.transport] # The whole block is optional. Specify which transport to use
 type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise"]. Default: "tcp"
@@ -137,6 +138,7 @@ token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
 nodelay = true # Optional. Override the `client.transport.nodelay` per service
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
+max_retries = 0 # Optional. The maximum number of retries to connect to the server. Set to 0 to retry forever. Default: inherits the global config
 
 [client.services.service2] # Multiple services can be defined
 local_addr = "127.0.0.1:1082"

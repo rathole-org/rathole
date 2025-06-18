@@ -68,6 +68,7 @@ pub struct ClientServiceConfig {
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
+    pub max_retries: Option<u64>,
 }
 
 impl ClientServiceConfig {
@@ -211,6 +212,8 @@ pub struct ClientConfig {
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
     pub retry_interval: u64,
+    #[serde(default)]
+    pub max_retries: Option<u64>,
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -284,6 +287,9 @@ impl Config {
             }
             if s.retry_interval.is_none() {
                 s.retry_interval = Some(client.retry_interval);
+            }
+            if s.max_retries.is_none() {
+                s.max_retries = client.max_retries;
             }
         }
 

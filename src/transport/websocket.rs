@@ -153,7 +153,7 @@ impl AsyncWrite for WebsocketTunnel {
 
         match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec())) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(e) => Poll::Ready(Err(Error::other(err))),
+            Err(e) => Poll::Ready(Err(Error::other(e))),
         }
     }
 

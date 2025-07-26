@@ -85,8 +85,6 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          # Since rust 1.72, some platforms are tier 3
-#          toolchain: 1.74.0
           default: true
       
       - name: Install OpenSSL
@@ -176,7 +174,6 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-#          toolchain: stable
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}

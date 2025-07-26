@@ -55,9 +55,13 @@ async fn tcp() -> Result<()> {
     });
 
     test("tests/for_tcp/tcp_transport.toml", Type::Tcp).await?;
-    // FIXME: Self-signed certificate on Mac requires mannual interference. Disable CI for now
-    #[cfg(not(target_os = "macos"))]
-    #[cfg(any(feature = "native-tls", feature = "rustls"))]
+
+    #[cfg(any(
+         // FIXME: Self-signed certificate on macOS nativetls requires manual interference.
+         all(target_os = "macos", feature = "rustls"),
+         // On other OS accept run with either
+         all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
+     ))]
     test("tests/for_tcp/tls_transport.toml", Type::Tcp).await?;
 
     #[cfg(feature = "noise")]
@@ -92,9 +96,13 @@ async fn udp() -> Result<()> {
     });
 
     test("tests/for_udp/tcp_transport.toml", Type::Udp).await?;
-    // See above
-    #[cfg(not(target_os = "macos"))]
-    #[cfg(any(feature = "native-tls", feature = "rustls"))]
+
+    #[cfg(any(
+         // FIXME: Self-signed certificate on macOS nativetls requires manual interference.
+         all(target_os = "macos", feature = "rustls"),
+         // On other OS accept run with either
+         all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
+     ))]
     test("tests/for_udp/tls_transport.toml", Type::Udp).await?;
 
     #[cfg(feature = "noise")]

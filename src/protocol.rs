@@ -78,7 +78,7 @@ impl UdpTraffic {
             len: self.data.len() as UdpPacketLen,
         };
 
-        let v = bincode::serialize(&hdr).unwrap();
+        let v = bincode::serialize(&hdr)?;
 
         trace!("Write {:?} of length {}", hdr, v.len());
         writer.write_u8(v.len() as u8).await?;

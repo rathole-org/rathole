@@ -49,9 +49,9 @@ openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certf
 
 ## Noise Protocol
 
-### Quickstart for the Noise Protocl
+### Quickstart for the Noise Protocol
 
-In one word, the [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweigt, easy to configure and drop-in replacement of TLS. No need to create a self-sign certificate to secure the connection.
+In one word, the [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweight, easy to configure and drop-in replacement of TLS. No need to create a self-sign certificate to secure the connection.
 
 `rathole` comes with a reasonable default configuration for noise protocol. You can a glimpse of the minimal [example](../examples/noise_nk) for how it will look like.
 

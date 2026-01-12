@@ -1,3 +1,7 @@
+#![allow(dead_code, unused, unused_imports)]
+#[cfg(not(any(feature = "client", feature = "server")))]
+compile_error!("Enable at least one of features `client` or `server`.");
+
 mod cli;
 mod config;
 mod config_watcher;

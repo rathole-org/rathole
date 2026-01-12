@@ -1,11 +1,12 @@
 [package]
 name = "rathole"
-version = "0.5.0"
+version = "0.6.0-beta.1"
+rust-version = "1.92"
 edition = "2021"
 authors = ["Yujia Qiao <code@rapiz.me>"]
 description = "A reverse proxy for NAT traversal"
 license = "Apache-2.0"
-repository = "https://github.com/rapiz1/rathole"
+repository = "https://github.com/rathole-org/rathole"
 readme = "README.md"
 build = "build.rs"
 include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
@@ -136,3 +137,4 @@ vergen = { version = "7.4.2", default-features = false, features = [
     "cargo",
 ] }
 anyhow = "1.0"
+

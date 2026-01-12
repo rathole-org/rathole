@@ -22,7 +22,7 @@ impl std::fmt::Debug for NoiseTransport {
 }
 
 impl NoiseTransport {
-    fn builder(&self) -> Builder {
+    fn builder(&self) -> Builder<'_> {
         let builder = Builder::new(self.params.clone()).local_private_key(&self.local_private_key);
         match &self.remote_public_key {
             Some(x) => builder.remote_public_key(x),

@@ -82,11 +82,7 @@ jobs:
             cross: false
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          default: true
-      
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install OpenSSL
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get install pkg-config libssl-dev
@@ -171,9 +167,7 @@ jobs:
     needs: release
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}

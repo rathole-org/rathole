@@ -21,19 +21,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          components: clippy
-      - uses: Swatinem/rust-cache@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Clippy
         run: cargo clippy -- -D warnings
       - name: Setup cargo-hack
         run: cargo install cargo-hack
       - name: Check all features
         run: >
-          cargo hack check --feature-powerset --no-dev-deps
-          --mutually-exclusive-features default,native-tls,websocket-native-tls,rustls,websocket-rustls
+          cargo hack check --feature-powerset --no-dev-deps --exclude-no-default-features
+          --mutually-exclusive-features native-tls,rustls
+          --mutually-exclusive-features websocket-native-tls,websocket-rustls
+          --at-least-one-of native-tls,rustls
+          --at-least-one-of client,server
+
+
 
   build:
     name: Build for ${{ matrix.target }}
@@ -56,10 +57,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          profile: minimal
-      - uses: Swatinem/rust-cache@v1
+          rustflags: ""
       - name: Build
         run: cargo build
       - name: Run tests with native-tls

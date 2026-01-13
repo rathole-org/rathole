@@ -1,0 +1,20 @@
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "test_token_max_clients"
+heartbeat_interval = 10  # Detect client disconnect in ~10s instead of default 60s
+
+# Service with single client limit
+# Only one client can connect at a time
+[server.services.adb_tunnel]
+bind_addr = "0.0.0.0:5038"
+max_clients = 1
+
+# Service with multiple client limit
+[server.services.multi_client]
+bind_addr = "0.0.0.0:5039"
+max_clients = 5
+
+# Service with unlimited clients (default behavior)
+# max_clients not set means no limit
+[server.services.unlimited]
+bind_addr = "0.0.0.0:5040"

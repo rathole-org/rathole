@@ -1,0 +1,6 @@
+[client]
+remote_addr = "127.0.0.1:2333"
+default_token = "simple_test"
+
+[client.services.test_service]
+local_addr = "127.0.0.1:8888"

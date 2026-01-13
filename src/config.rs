@@ -104,6 +104,9 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
+    /// Maximum number of concurrent client connections allowed for this service.
+    /// None or 0 means unlimited connections (default behavior).
+    pub max_clients: Option<usize>,
 }
 
 impl ServerServiceConfig {

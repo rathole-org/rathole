@@ -1,0 +1,12 @@
+[client]
+remote_addr = "127.0.0.1:2333"
+default_token = "test_token_max_clients"
+
+[client.services.adb_tunnel]
+local_addr = "127.0.0.1:5037"
+
+[client.services.multi_client]
+local_addr = "127.0.0.1:8080"
+
+[client.services.unlimited]
+local_addr = "127.0.0.1:8081"

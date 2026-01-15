@@ -19,12 +19,21 @@ const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 const PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8081";
 const ECHO_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2334";
 const PINGPONG_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2335";
+
+// assume tmp directory exists (since sockets only work on unix systems this should be fine)
+const ECHO_SERVER_SOCKET: &str = "/tmp/rathole_integration_test/echo.sock";
+const PINGPONG_SERVER_SOCKET: &str = "/tmp/rathole_integration_test/pingpong.sock";
+const ECHO_SERVER_SOCKET_EXPOSED: &str = "/tmp/rathole_integration_test/echo_exposed.sock";
+const PINGPONG_SERVER_SOCKET_EXPOSED: &str = "/tmp/rathole_integration_test/pingpong_exposed.sock";
+
 const HITTER_NUM: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 enum Type {
     Tcp,
     Udp,
+    #[cfg(unix)]
+    SocketStream,
 }
 
 fn init() {
@@ -114,6 +123,73 @@ async fn udp() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn socket_stream() -> Result<()> {
+    init();
+
+    if !std::path::Path::new("/tmp/rathole_integration_test").exists() {
+        std::fs::remove_dir_all("/tmp/rathole_integration_test")?;
+        std::fs::create_dir("/tmp/rathole_integration_test")?;
+    }
+
+    // Spawn a echo server
+    tokio::spawn(async move {
+        if let Err(e) = common::socket_stream::echo_server(ECHO_SERVER_SOCKET).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    // Spawn a pingpong server
+    tokio::spawn(async move {
+        if let Err(e) = common::socket_stream::pingpong_server(PINGPONG_SERVER_SOCKET).await {
+            panic!("Failed to run the pingpong server for testing: {:?}", e);
+        }
+    });
+
+    test(
+        "tests/for_socket_stream/tcp_transport.toml",
+        Type::SocketStream,
+    )
+    .await?;
+
+    #[cfg(any(
+         // FIXME: Self-signed certificate on macOS nativetls requires manual interference.
+         all(target_os = "macos", feature = "rustls"),
+         // On other OS accept run with either
+         all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
+     ))]
+    test(
+        "tests/for_socket_stream/tls_transport.toml",
+        Type::SocketStream,
+    )
+    .await?;
+
+    #[cfg(feature = "noise")]
+    test(
+        "tests/for_socket_stream/noise_transport.toml",
+        Type::SocketStream,
+    )
+    .await?;
+
+    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+    test(
+        "tests/for_socket_stream/websocket_transport.toml",
+        Type::SocketStream,
+    )
+    .await?;
+
+    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+    test(
+        "tests/for_socket_stream/websocket_tls_transport.toml",
+        Type::SocketStream,
+    )
+    .await?;
 
     Ok(())
 }
@@ -225,6 +301,8 @@ async fn echo_hitter(addr: &'static str, t: Type) -> Result<()> {
     match t {
         Type::Tcp => tcp_echo_hitter(addr).await,
         Type::Udp => udp_echo_hitter(addr).await,
+        #[cfg(unix)]
+        Type::SocketStream => socket_stream_echo_hitter(ECHO_SERVER_SOCKET_EXPOSED).await,
     }
 }
 
@@ -232,6 +310,8 @@ async fn pingpong_hitter(addr: &'static str, t: Type) -> Result<()> {
     match t {
         Type::Tcp => tcp_pingpong_hitter(addr).await,
         Type::Udp => udp_pingpong_hitter(addr).await,
+        #[cfg(unix)]
+        Type::SocketStream => socket_stream_pingpong_hitter(PINGPONG_SERVER_SOCKET_EXPOSED).await,
     }
 }
 
@@ -301,6 +381,48 @@ async fn udp_pingpong_hitter(addr: &'static str) -> Result<()> {
 
         assert_eq!(rd, PONG.as_bytes());
     }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn socket_stream_echo_hitter(addr: &'static str) -> Result<()> {
+    use tokio::net::UnixStream;
+    use tracing::warn;
+
+    while !std::path::Path::new(addr).exists() {
+        warn!("waiting for socket {} to be created", addr);
+        time::sleep(Duration::from_millis(500)).await;
+    }
+    let mut conn = UnixStream::connect(addr).await?;
+
+    let mut wr = [0u8; 1024];
+    let mut rd = [0u8; 1024];
+    for _ in 0..100 {
+        rand::thread_rng().fill(&mut wr);
+        conn.write_all(&wr).await?;
+        conn.read_exact(&mut rd).await?;
+        assert_eq!(wr, rd);
+    }
+    conn.shutdown().await?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn socket_stream_pingpong_hitter(addr: &'static str) -> Result<()> {
+    use tokio::net::UnixStream;
+    let mut conn = UnixStream::connect(addr).await?;
+
+    let wr = PING.as_bytes();
+    let mut rd = [0u8; PONG.len()];
+
+    for _ in 0..100 {
+        conn.write_all(wr).await?;
+        conn.read_exact(&mut rd).await?;
+        assert_eq!(rd, PONG.as_bytes());
+    }
+    conn.shutdown().await?;
 
     Ok(())
 }

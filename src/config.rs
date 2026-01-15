@@ -86,6 +86,9 @@ pub enum ServiceType {
     Tcp,
     #[serde(rename = "udp")]
     Udp,
+    #[cfg(unix)]
+    #[serde(rename = "socket_stream")]
+    SocketStream,
 }
 
 fn default_service_type() -> ServiceType {

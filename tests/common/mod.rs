@@ -110,3 +110,52 @@ pub mod udp {
         }
     }
 }
+
+#[cfg(unix)]
+pub mod socket_stream {
+    use tokio::net::{UnixListener, UnixStream};
+
+    use super::*;
+
+    pub async fn echo_server<P: AsRef<std::path::Path>>(addr: P) -> Result<()> {
+        std::fs::remove_file(&addr).ok();
+
+        let l = UnixListener::bind(&addr)?;
+
+        loop {
+            let (conn, _addr) = l.accept().await?;
+            tokio::spawn(async move {
+                let _ = echo(conn).await;
+            });
+        }
+    }
+
+    pub async fn pingpong_server<P: AsRef<std::path::Path>>(addr: P) -> Result<()> {
+        std::fs::remove_file(&addr).ok();
+
+        let l = UnixListener::bind(&addr)?;
+
+        loop {
+            let (conn, _addr) = l.accept().await?;
+            tokio::spawn(async move {
+                let _ = pingpong(conn).await;
+            });
+        }
+    }
+
+    async fn echo(conn: UnixStream) -> Result<()> {
+        let (mut rd, mut wr) = conn.into_split();
+        io::copy(&mut rd, &mut wr).await?;
+        Ok(())
+    }
+
+    async fn pingpong(mut conn: UnixStream) -> Result<()> {
+        let mut buf = [0u8; PING.len()];
+
+        while conn.read_exact(&mut buf).await? != 0 {
+            assert_eq!(buf, PING.as_bytes());
+            conn.write_all(PONG.as_bytes()).await?;
+        }
+        Ok(())
+    }
+}

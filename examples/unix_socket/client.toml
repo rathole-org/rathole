@@ -1,0 +1,7 @@
+[client]
+remote_addr = "localhost:2333" # The address of the server. The port must be the same with the port in `server.bind_addr`
+
+[client.services.my_socket_service]
+type = "socket_stream"
+token = "use_a_secret_that_only_you_know" # Must be the same with the server to pass the validation
+local_addr = "/var/run/example.sock" # The address of the service that needs to be exposed

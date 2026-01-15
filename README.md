@@ -132,7 +132,7 @@ remote_public_key = "key_encoded_in_base64" # Optional
 tls = true # If `true` then it will use settings in `client.transport.tls`
 
 [client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
+type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp", "socket_stream"]. Default: "tcp"
 token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
 nodelay = true # Optional. Override the `client.transport.nodelay` per service

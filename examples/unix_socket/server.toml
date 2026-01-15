@@ -1,0 +1,8 @@
+[server]
+bind_addr = "0.0.0.0:2333" # `2333` specifies the port that rathole listens for clients
+
+
+[server.services.my_socket_service]
+type = "socket_stream"
+token = "use_a_secret_that_only_you_know" # Token that is used to authenticate the client for the service. Change to an arbitrary value.
+bind_addr = "/var/run/example.sock" # specifies the Unix socket path that exposes `my_socket_service` on the server side

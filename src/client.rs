@@ -21,6 +21,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
@@ -227,7 +230,14 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
+                .await?;
+        }
+        DataChannelCmd::StartForwardSocketStream => {
+            if args.service.service_type != ServiceType::SocketStream {
+                bail!("Expect SocketStream traffic. Please check the configuration.")
+            }
+            run_data_channel_for_socket_stream::<T>(conn, &args.service.local_addr).await?;
         }
     }
     Ok(())
@@ -240,7 +250,6 @@ async fn run_data_channel_for_tcp<T: Transport>(
     local_addr: &str,
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
-
     let mut local = TcpStream::connect(local_addr)
         .await
         .with_context(|| format!("Failed to connect to {}", local_addr))?;
@@ -255,7 +264,11 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    local_addr: &str,
+    prefer_ipv6: bool,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -329,6 +342,20 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
             let _ = tx.send(packet.data).await;
         }
     }
+}
+
+#[cfg(unix)]
+async fn run_data_channel_for_socket_stream<T: Transport>(
+    mut conn: T::Stream,
+    local_addr: &str,
+) -> Result<()> {
+    debug!("New data channel starts forwarding");
+
+    let mut local = UnixStream::connect(local_addr)
+        .await
+        .with_context(|| format!("Failed to connect to {}", local_addr))?;
+    let _ = copy_bidirectional(&mut conn, &mut local).await;
+    Ok(())
 }
 
 // Run a UdpSocket for the visitor `from`

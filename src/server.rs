@@ -15,6 +15,7 @@ use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
@@ -22,6 +23,9 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
+
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
@@ -35,6 +39,9 @@ type Nonce = protocol::Digest; // Also called `session_key`
 
 const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
 const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
+#[cfg(unix)]
+const SOCKET_STREAM_POOL_SIZE: usize = 8; // The number of cached connections for SocketStream services
+
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
@@ -417,6 +424,8 @@ where
         let pool_size = match service.service_type {
             ServiceType::Tcp => TCP_POOL_SIZE,
             ServiceType::Udp => UDP_POOL_SIZE,
+            #[cfg(unix)]
+            ServiceType::SocketStream => SOCKET_STREAM_POOL_SIZE,
         };
 
         for _i in 0..pool_size {
@@ -454,6 +463,23 @@ where
                     )
                     .await
                     .with_context(|| "Failed to run TCP connection pool")
+                    {
+                        error!("{:#}", e);
+                    }
+                }
+                .instrument(Span::current()),
+            ),
+            #[cfg(unix)]
+            ServiceType::SocketStream => tokio::spawn(
+                async move {
+                    if let Err(e) = run_socket_stream_connection_pool::<T>(
+                        bind_addr,
+                        data_ch_rx,
+                        data_ch_req_tx,
+                        shutdown_rx_clone,
+                    )
+                    .await
+                    .with_context(|| "Failed to run SocketStream connection pool")
                     {
                         error!("{:#}", e);
                     }
@@ -622,6 +648,88 @@ fn tcp_listen_and_send(
     rx
 }
 
+#[cfg(unix)]
+fn socket_stream_listen_and_send(
+    addr: String,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) -> mpsc::Receiver<UnixStream> {
+    let (tx, rx) = mpsc::channel(CHAN_SIZE);
+
+    tokio::spawn(async move {
+        let l = retry_notify_with_deadline(listen_backoff(),  || async {
+            if Path::new(&addr).exists() {
+                std::fs::remove_file(&addr).unwrap_or_else(|_| error!("Failed to delete stale socket file {}", &addr));
+            };
+            Ok(UnixListener::bind(&addr)?)
+        }, |e, duration| {
+            error!("{:#}. Retry in {:?}", e, duration);
+        }, &mut shutdown_rx).await
+        .with_context(|| "Failed to listen for the service");
+
+        let l: UnixListener = match l {
+            Ok(v) => v,
+            Err(e) => {
+                error!("{:#}", e);
+                return;
+            }
+        };
+
+        info!("Listening at {}", &addr);
+
+        // Retry at least every 1s
+        let mut backoff = ExponentialBackoff {
+            max_interval: Duration::from_secs(1),
+            max_elapsed_time: None,
+            ..Default::default()
+        };
+
+        // Wait for visitors and the shutdown signal
+        loop {
+            tokio::select! {
+                val = l.accept() => {
+                    match val {
+                        Err(e) => {
+                            // `l` is a Socket listener so this must be a IO error
+                            // Possibly a EMFILE. So sleep for a while
+                            error!("{}. Sleep for a while", e);
+                            if let Some(d) = backoff.next_backoff() {
+                                time::sleep(d).await;
+                            } else {
+                                // This branch will never be reached for current backoff policy
+                                error!("Too many retries. Aborting...");
+                                break;
+                            }
+                        }
+                        Ok((incoming, addr)) => {
+                            // For every visitor, request to create a data channel
+                            if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
+                                // An error indicates the control channel is broken
+                                // So break the loop
+                                break;
+                            }
+
+                            backoff.reset();
+
+                            debug!("New visitor from {:?}", addr);
+
+                            // Send the visitor to the connection pool
+                            let _ = tx.send(incoming).await;
+                        }
+                    }
+                },
+                _ = shutdown_rx.recv() => {
+                    break;
+                }
+            }
+        }
+
+        info!("TCPListener shutdown");
+    }.instrument(Span::current()));
+
+    rx
+}
+
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<T: Transport>(
     bind_addr: String,
@@ -643,6 +751,42 @@ async fn run_tcp_connection_pool<T: Transport>(
                 } else {
                     // Current data channel is broken. Request for a new one
                     if data_ch_req_tx.send(true).is_err() {
+                        break 'pool;
+                    }
+                }
+            } else {
+                break 'pool;
+            }
+        }
+    }
+
+    info!("Shutdown");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[instrument(skip_all)]
+async fn run_socket_stream_connection_pool<T: Transport>(
+    bind_addr: String,
+    mut data_ch_rx: mpsc::Receiver<T::Stream>,
+    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    let mut visitor_rx =
+        socket_stream_listen_and_send(bind_addr, _data_ch_req_tx.clone(), shutdown_rx);
+    let cmd = bincode::serialize(&DataChannelCmd::StartForwardSocketStream).unwrap();
+
+    'pool: while let Some(mut visitor) = visitor_rx.recv().await {
+        loop {
+            if let Some(mut ch) = data_ch_rx.recv().await {
+                if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                    tokio::spawn(async move {
+                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                    });
+                    break;
+                } else {
+                    // Current data channel is broken. Request for a new one
+                    if _data_ch_req_tx.send(true).is_err() {
                         break 'pool;
                     }
                 }

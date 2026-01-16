@@ -233,6 +233,7 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
                 .await?;
         }
+        #[cfg(unix)]
         DataChannelCmd::StartForwardSocketStream => {
             if args.service.service_type != ServiceType::SocketStream {
                 bail!("Expect SocketStream traffic. Please check the configuration.")

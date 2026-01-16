@@ -133,8 +133,10 @@ async fn socket_stream() -> Result<()> {
     init();
 
     if !std::path::Path::new("/tmp/rathole_integration_test").exists() {
-        std::fs::remove_dir_all("/tmp/rathole_integration_test")?;
-        std::fs::create_dir("/tmp/rathole_integration_test")?;
+        std::fs::remove_dir_all("/tmp/rathole_integration_test").ok();
+        std::fs::create_dir_all("/tmp/rathole_integration_test").ok();
+    } else {
+        std::fs::create_dir_all("/tmp/rathole_integration_test").ok();
     }
 
     // Spawn a echo server

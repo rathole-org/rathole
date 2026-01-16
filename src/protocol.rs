@@ -52,6 +52,7 @@ pub enum ControlChannelCmd {
     HeartBeat,
 }
 
+#[allow(clippy::enum_variant_names)] // to keep consistent naming
 #[derive(Deserialize, Serialize, Debug)]
 pub enum DataChannelCmd {
     StartForwardTcp,

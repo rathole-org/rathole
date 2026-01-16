@@ -770,7 +770,7 @@ async fn run_socket_stream_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
-    mut shutdown_rx: broadcast::Receiver<bool>,
+    shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut visitor_rx =
         socket_stream_listen_and_send(bind_addr, _data_ch_req_tx.clone(), shutdown_rx);

@@ -153,20 +153,20 @@ jobs:
           fi
 
           NOTES="$(cat <<EOF
-Automated build from branch \`dev\`.
+          Automated build from branch \`dev\`.
 
-- Commit: \`${GITHUB_SHA}\`
-- Docker:
-  - \`${IMAGE}:dev\` (moving)
-  - \`${IMAGE}:dev-${SHORT_SHA}\` (pinned tag)
-  - \`${IMAGE}@${DOCKER_DIGEST}\` (pinned digest)
+          - Commit: \`${GITHUB_SHA}\`
+          - Docker:
+            - \`${IMAGE}:dev\` (moving)
+            - \`${IMAGE}:dev-${SHORT_SHA}\` (pinned tag)
+            - \`${IMAGE}@${DOCKER_DIGEST}\` (pinned digest)
 
-Changes since previous dev build:
-\`\`\`
-${CHANGES}
-\`\`\`
-EOF
-)"
+          Changes since previous dev build:
+          \`\`\`
+          ${CHANGES}
+          \`\`\`
+          EOF
+          )"
 
           TITLE="Dev build (${SHORT_SHA})"
 

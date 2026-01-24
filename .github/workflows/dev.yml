@@ -125,10 +125,17 @@ jobs:
             echo "sha=" >> $GITHUB_OUTPUT
           fi
 
-      - name: Move dev tag to this commit
+      - name: Move dev tag to this commit (and update prev tag)
         shell: bash
         run: |
           set -euxo pipefail
+          PREV_TAG="${RELEASE_TAG}-prev"
+
+          if [[ -n "${{ steps.prev.outputs.sha }}" ]]; then
+            git tag -f "${PREV_TAG}" "${{ steps.prev.outputs.sha }}"
+            git push -f origin "refs/tags/${PREV_TAG}"
+          fi
+
           git tag -f "${RELEASE_TAG}" "${GITHUB_SHA}"
           git push -f origin "refs/tags/${RELEASE_TAG}"
 
@@ -137,22 +144,31 @@ jobs:
         with:
           path: dist
 
-      - name: Create/Update GitHub Release + upload assets
+      - name: Generate PR-based notes + Update Release + upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCKER_DIGEST: ${{ needs.docker.outputs.digest }}
         shell: bash
         run: |
           set -euxo pipefail
-          SHORT_SHA="${GITHUB_SHA::7}"
 
-          if [[ -n "${{ steps.prev.outputs.sha }}" ]]; then
-            CHANGES="$(git log --oneline --no-decorate ${{ steps.prev.outputs.sha }}..${GITHUB_SHA})"
-          else
-            CHANGES="$(git log --oneline --no-decorate -n 30)"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY}"
+          PREV_TAG="${RELEASE_TAG}-prev"
+
+          ARGS=(-f tag_name="${RELEASE_TAG}" -f target_commitish="${GITHUB_SHA}")
+          if git rev-parse -q --verify "refs/tags/${PREV_TAG}" >/dev/null; then
+            ARGS+=(-f previous_tag_name="${PREV_TAG}")
           fi
 
-          NOTES="$(cat <<EOF
+          GEN_NOTES="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            "${ARGS[@]}" \
+            --jq '.body'
+          )"
+
+          cat > RELEASE_NOTES.md <<EOF
           Automated build from branch \`dev\`.
 
           - Commit: \`${GITHUB_SHA}\`
@@ -161,20 +177,32 @@ jobs:
             - \`${IMAGE}:dev-${SHORT_SHA}\` (pinned tag)
             - \`${IMAGE}@${DOCKER_DIGEST}\` (pinned digest)
 
-          Changes since previous dev build:
+          Pull:
+          \`\`\`bash
+          docker pull ${IMAGE}:dev
+          docker pull ${IMAGE}:dev-${SHORT_SHA}
+          docker pull ${IMAGE}@${DOCKER_DIGEST}
           \`\`\`
-          ${CHANGES}
-          \`\`\`
+
+          ---
+
+          ${GEN_NOTES}
           EOF
-          )"
 
           TITLE="Dev build (${SHORT_SHA})"
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release edit "${RELEASE_TAG}" --prerelease --title "${TITLE}" --notes "${NOTES}"
+            gh release edit "${RELEASE_TAG}" \
+              --prerelease \
+              --title "${TITLE}" \
+              --notes-file RELEASE_NOTES.md
           else
-            gh release create "${RELEASE_TAG}" --prerelease --title "${TITLE}" --notes "${NOTES}"
+            gh release create "${RELEASE_TAG}" \
+              --prerelease \
+              --title "${TITLE}" \
+              --notes-file RELEASE_NOTES.md
           fi
 
           mapfile -t FILES < <(find dist -type f -name '*.tar.gz' -print)
           gh release upload "${RELEASE_TAG}" "${FILES[@]}" --clobber
+

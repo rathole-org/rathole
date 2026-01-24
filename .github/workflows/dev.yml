@@ -13,6 +13,7 @@ concurrency:
 permissions:
   contents: write
   packages: write
+  actions: read
 
 env:
   RELEASE_TAG: dev-latest
@@ -132,14 +133,27 @@ jobs:
         run: |
           set -euxo pipefail
           PREV_TAG="${RELEASE_TAG}-prev"
+          OLD_SHA="${{ steps.prev.outputs.sha }}"
 
-          if [[ -n "${{ steps.prev.outputs.sha }}" ]]; then
-            git tag -f "${PREV_TAG}" "${{ steps.prev.outputs.sha }}"
-            git push -f origin "refs/tags/${PREV_TAG}"
+          if [[ -n "${OLD_SHA}" ]]; then
+            git tag -f "${PREV_TAG}" "${OLD_SHA}"
+
+            if ! git push -f origin "refs/tags/${PREV_TAG}" 2>push_prev.err; then
+              if grep -q "refusing to allow a GitHub App to create or update workflow" push_prev.err; then
+                echo "::warning::Could not update ${PREV_TAG} because ${OLD_SHA} modifies .github/workflows/. Continuing without previous_tag_name this run."
+                # Remove the local tag so later steps don't mistakenly think it exists remotely
+                git tag -d "${PREV_TAG}" || true
+              else
+                echo "Unexpected failure pushing ${PREV_TAG}:"
+                cat push_prev.err
+                exit 1
+              fi
+            fi
           fi
 
           git tag -f "${RELEASE_TAG}" "${GITHUB_SHA}"
           git push -f origin "refs/tags/${RELEASE_TAG}"
+
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -161,7 +175,7 @@ jobs:
           PREV_TAG="${RELEASE_TAG}-prev"
 
           ARGS=(-f tag_name="${RELEASE_TAG}" -f target_commitish="${GITHUB_SHA}")
-          if git rev-parse -q --verify "refs/tags/${PREV_TAG}" >/dev/null; then
+          if git ls-remote --tags origin "refs/tags/${PREV_TAG}" | grep -q .; then
             ARGS+=(-f previous_tag_name="${PREV_TAG}")
           fi
 

@@ -3,6 +3,8 @@ name: Dev build (binaries + docker)
 on:
   push:
     branches: [dev]
+  workflow_dispatch:
+
 
 concurrency:
   group: dev-build-${{ github.ref }}
@@ -55,7 +57,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          OUT="rathole-dev-${{ matrix.target }}.tar.gz"
+          OUT="rathole-dev-${{ matrix.target }}-${GITHUB_SHA::7}.tar.gz"
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/
           tar -czf "${OUT}" -C dist .
@@ -143,6 +145,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: "!*.dockerbuild" # ignore build record artifacts
+          merge-multiple: true      # merge into single directory
 
       - name: Generate PR-based notes + Update Release + upload assets
         env:
@@ -204,5 +208,11 @@ jobs:
           fi
 
           mapfile -t FILES < <(find dist -type f -name '*.tar.gz' -print)
+          if (( ${#FILES[@]} == 0 )); then
+            echo "No *.tar.gz artifacts found under dist/"
+            find dist -maxdepth 3 -type f -print || true
+            exit 1
+          fi
           gh release upload "${RELEASE_TAG}" "${FILES[@]}" --clobber
+
 

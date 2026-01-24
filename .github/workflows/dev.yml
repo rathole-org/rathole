@@ -65,7 +65,7 @@ jobs:
           ls -lah "${OUT}"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
+          name: bin-${{ matrix.target }}
           path: rathole-dev-${{ matrix.target }}.tar.gz
 
   docker:
@@ -159,8 +159,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: "!*.dockerbuild" # ignore build record artifacts
-          merge-multiple: true      # merge into single directory
+          pattern: "bin-*"
+          merge-multiple: true
+
+      - name: Show downloaded files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -lah
+          find dist -maxdepth 3 -type f -print || true
 
       - name: Generate PR-based notes + Update Release + upload assets
         env:

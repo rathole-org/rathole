@@ -210,7 +210,7 @@ pub fn generate_proxy_protocol_header(s: &TcpStream, proxy_protocol: &str) -> Re
                 local_addr.port()
             );
 
-            return Ok(header.into_bytes());
+            Ok(header.into_bytes())
         }
         "v2" => {
 
@@ -240,11 +240,11 @@ pub fn generate_proxy_protocol_header(s: &TcpStream, proxy_protocol: &str) -> Re
     
             trace!("Proxy protocol v2 header: {:02x?}", header);
     
-            return Ok(header);
+            Ok(header)
 
         },
         _ => {
-            return Err(anyhow!("Unknown proxy protocol {}", proxy_protocol))
+            Err(anyhow!("Unknown proxy protocol {}", proxy_protocol))
         }
     }
 

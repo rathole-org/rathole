@@ -19,7 +19,7 @@ type = "tcp"
 
 [server.services.echo]
 bind_addr = "0.0.0.0:2334"
-enable_proxy_protocol = true
+proxy_protocol = "v2"
 
 [server.services.pingpong]
 bind_addr = "0.0.0.0:2335"

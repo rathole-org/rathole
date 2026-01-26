@@ -248,31 +248,189 @@ pub fn generate_proxy_protocol_header(s: &TcpStream, proxy_protocol: &str) -> Re
         }
     }
 
-    #[tokio::test]
-    async fn header_bytes_are_sent_before_payload_when_written_then_forwarded() {
-        // This simulates the exact ordering your server code implements:
-        // write PROXY header -> flush -> start forwarding bytes. :contentReference[oaicite:1]{index=1}
+}
 
-        // Visitor side connection (incoming connection to the server)
+#[cfg(test)]
+mod proxy_protocol_tests {
+    use super::generate_proxy_protocol_header;
+    use std::net::{IpAddr, SocketAddr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const V2_SIG: [u8; 12] = [
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+    ];
+
+    fn expected_v1_header(local: SocketAddr, remote: SocketAddr) -> Vec<u8> {
+        let proto = if local.is_ipv4() { "TCP4" } else { "TCP6" };
+        format!(
+            "PROXY {proto} {} {} {} {}\r\n",
+            remote.ip(),
+            local.ip(),
+            remote.port(),
+            local.port()
+        )
+        .into_bytes()
+    }
+
+    fn expected_v2_header(local: SocketAddr, remote: SocketAddr) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&V2_SIG);
+        out.push(0x21); // v2 + PROXY command
+
+        match (remote.ip(), local.ip()) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                out.push(0x11); // AF_INET (0x1) + STREAM (0x1) => 0x11
+                out.extend_from_slice(&[0x00, 0x0c]); // len = 12
+                out.extend_from_slice(&src.octets());
+                out.extend_from_slice(&dst.octets());
+            }
+            (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                out.push(0x21); // AF_INET6 (0x2) + STREAM (0x1) => 0x21
+                out.extend_from_slice(&[0x00, 0x24]); // len = 36
+                out.extend_from_slice(&src.octets());
+                out.extend_from_slice(&dst.octets());
+            }
+            _ => panic!("mismatched address families in test"),
+        }
+
+        // src port then dst port
+        out.extend_from_slice(&remote.port().to_be_bytes());
+        out.extend_from_slice(&local.port().to_be_bytes());
+        out
+    }
+
+    #[tokio::test]
+    async fn v1_header_ipv4_format_is_correct() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let local = server.local_addr().unwrap();
+        let remote = server.peer_addr().unwrap();
+        assert!(local.is_ipv4());
+        assert!(remote.is_ipv4());
+
+        let expected = expected_v1_header(local, remote);
+        let got = generate_proxy_protocol_header(&server, "v1").unwrap();
+
+        assert_eq!(got, expected);
+        assert!(got.ends_with(b"\r\n"));
+        assert!(got.starts_with(b"PROXY TCP4 "));
+    }
+
+    #[tokio::test]
+    async fn v2_header_ipv4_format_is_correct() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let local = server.local_addr().unwrap();
+        let remote = server.peer_addr().unwrap();
+        assert!(local.is_ipv4());
+        assert!(remote.is_ipv4());
+
+        let expected = expected_v2_header(local, remote);
+        let got = generate_proxy_protocol_header(&server, "v2").unwrap();
+
+        assert_eq!(got, expected);
+
+        // Spot-check fixed fields and sizes
+        assert_eq!(&got[..12], &V2_SIG);
+        assert_eq!(got[12], 0x21);
+        assert_eq!(got[13], 0x11);
+        assert_eq!(&got[14..16], &[0x00, 0x0c]);
+        assert_eq!(got.len(), 28);
+    }
+
+    #[tokio::test]
+    async fn v1_header_ipv6_format_is_correct_or_skipped_if_unavailable() {
+        let listener = match TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let addr = listener.local_addr().unwrap();
+
+        let _client = match TcpStream::connect(addr).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let (server, _) = listener.accept().await.unwrap();
+
+        let local = server.local_addr().unwrap();
+        let remote = server.peer_addr().unwrap();
+        assert!(local.is_ipv6());
+        assert!(remote.is_ipv6());
+
+        let expected = expected_v1_header(local, remote);
+        let got = generate_proxy_protocol_header(&server, "v1").unwrap();
+
+        assert_eq!(got, expected);
+        assert!(got.ends_with(b"\r\n"));
+        assert!(got.starts_with(b"PROXY TCP6 "));
+    }
+
+    #[tokio::test]
+    async fn v2_header_ipv6_format_is_correct_or_skipped_if_unavailable() {
+        let listener = match TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let addr = listener.local_addr().unwrap();
+
+        let _client = match TcpStream::connect(addr).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let (server, _) = listener.accept().await.unwrap();
+
+        let local = server.local_addr().unwrap();
+        let remote = server.peer_addr().unwrap();
+        assert!(local.is_ipv6());
+        assert!(remote.is_ipv6());
+
+        let expected = expected_v2_header(local, remote);
+        let got = generate_proxy_protocol_header(&server, "v2").unwrap();
+
+        assert_eq!(got, expected);
+        assert_eq!(&got[..12], &V2_SIG);
+        assert_eq!(got[12], 0x21);
+        assert_eq!(got[13], 0x21);
+        assert_eq!(&got[14..16], &[0x00, 0x24]);
+        assert_eq!(got.len(), 52);
+    }
+
+    #[tokio::test]
+    async fn unknown_proxy_protocol_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let err = generate_proxy_protocol_header(&server, "nope").unwrap_err();
+        assert!(err.to_string().contains("Unknown proxy protocol"));
+    }
+
+    async fn header_is_sent_before_payload(version: &'static str) {
         let visitor_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let visitor_addr = visitor_listener.local_addr().unwrap();
 
         let mut visitor_client = TcpStream::connect(visitor_addr).await.unwrap();
         let (mut visitor_server, _) = visitor_listener.accept().await.unwrap();
 
-        let local = visitor_server.local_addr().unwrap();
-        let remote = visitor_server.peer_addr().unwrap();
-        let expected_header = expected_v1_header(local, remote);
-
+        let expected_header = generate_proxy_protocol_header(&visitor_server, version).unwrap();
         let payload = b"hello proxy protocol";
 
-        // Simulate the “data channel” stream with a duplex pipe.
-        // (One end is what the server writes into; the other end is what the downstream reads.)
         let (mut ch, mut downstream) = tokio::io::duplex(4096);
 
         let server_task = tokio::spawn(async move {
-            let header = generate_proxy_protocol_v1_header(&visitor_server).unwrap();
-            ch.write_all(header.as_bytes()).await.unwrap();
+            let header = generate_proxy_protocol_header(&visitor_server, version).unwrap();
+            ch.write_all(&header).await.unwrap();
             ch.flush().await.unwrap();
 
             tokio::io::copy_bidirectional(&mut visitor_server, &mut ch)
@@ -280,20 +438,27 @@ pub fn generate_proxy_protocol_header(s: &TcpStream, proxy_protocol: &str) -> Re
                 .unwrap();
         });
 
-        // Visitor sends payload
         visitor_client.write_all(payload).await.unwrap();
         visitor_client.shutdown().await.unwrap();
 
-        // Downstream should see header first, then payload
-        let mut buf = vec![0u8; expected_header.as_bytes().len() + payload.len()];
+        let mut buf = vec![0u8; expected_header.len() + payload.len()];
         downstream.read_exact(&mut buf).await.unwrap();
 
-        let header_len = expected_header.as_bytes().len();
-        assert_eq!(&buf[..header_len], expected_header.as_bytes());
+        let header_len = expected_header.len();
+        assert_eq!(&buf[..header_len], &expected_header);
         assert_eq!(&buf[header_len..], payload);
 
-        // Close downstream to let copy_bidirectional finish cleanly
         drop(downstream);
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v1_header_bytes_are_sent_before_payload_when_forwarding() {
+        header_is_sent_before_payload("v1").await;
+    }
+
+    #[tokio::test]
+    async fn v2_header_bytes_are_sent_before_payload_when_forwarding() {
+        header_is_sent_before_payload("v2").await;
     }
 }

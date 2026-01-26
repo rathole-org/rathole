@@ -1,6 +1,8 @@
-use anyhow::{Ok, Result};
+use anyhow::{anyhow, Ok, Result};
 use common::{run_rathole_client, PING, PONG};
 use rand::Rng;
+use rand::RngCore;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -20,6 +22,11 @@ const PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8081";
 const ECHO_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2334";
 const PINGPONG_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2335";
 const HITTER_NUM: usize = 4;
+
+const PP2_SIG: [u8; 12] = [
+    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+];
+
 
 #[derive(Clone, Copy, Debug)]
 enum Type {
@@ -56,7 +63,8 @@ async fn tcp() -> Result<()> {
 
     test("tests/for_tcp/tcp_transport.toml", Type::Tcp).await?;
 
-    test_proxy_protocol("tests/for_tcp/tcp_transport_proxy_protocol.toml").await?;
+    test_proxy_protocol("tests/for_tcp/tcp_transport_proxy_protocol_v1.toml").await?;
+    test_proxy_protocol("tests/for_tcp/tcp_transport_proxy_protocol_v2.toml").await?;
 
     #[cfg(any(
          // FIXME: Self-signed certificate on macOS nativetls requires manual interference.
@@ -349,6 +357,86 @@ async fn test_proxy_protocol(config_path: &'static str) -> Result<()> {
     Ok(())
 }
 
+async fn read_proxy_protocol_header(rd: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Result<Vec<u8>> {
+    // Read 12 bytes to distinguish v2 signature vs v1 ("PROXY ...")
+    let mut first12 = [0u8; 12];
+    time::timeout(Duration::from_secs(5), rd.read_exact(&mut first12)).await??;
+
+    if first12 == PP2_SIG {
+        // v2: read fixed header (ver/cmd, fam/proto, len[2]) then read len bytes
+        let mut fixed = [0u8; 4];
+        time::timeout(Duration::from_secs(5), rd.read_exact(&mut fixed)).await??;
+
+        let len = u16::from_be_bytes([fixed[2], fixed[3]]) as usize;
+        let mut addr_and_tlvs = vec![0u8; len];
+        time::timeout(Duration::from_secs(5), rd.read_exact(&mut addr_and_tlvs)).await??;
+
+        let mut out = Vec::with_capacity(16 + len);
+        out.extend_from_slice(&first12);
+        out.extend_from_slice(&fixed);
+        out.extend_from_slice(&addr_and_tlvs);
+        Ok(out)
+    } else {
+        // v1: we've already consumed 12 bytes; read until newline to complete the line
+        let mut out = first12.to_vec();
+        let n = time::timeout(Duration::from_secs(5), rd.read_until(b'\n', &mut out)).await??;
+        if n == 0 {
+            return Err(anyhow!("EOF while reading proxy protocol v1 line"));
+        }
+        Ok(out)
+    }
+}
+
+fn assert_proxy_v2_matches(header: &[u8], local: SocketAddr, peer: SocketAddr) {
+    assert!(header.len() >= 16);
+    assert_eq!(&header[..12], &PP2_SIG);
+
+    // version/command
+    assert_eq!(header[12], 0x21, "expected v2 PROXY command (0x21)");
+
+    let fam_proto = header[13];
+    let len = u16::from_be_bytes([header[14], header[15]]) as usize;
+    assert_eq!(header.len(), 16 + len, "v2 length mismatch");
+
+    match fam_proto {
+        0x11 => {
+            // INET + STREAM, minimum 12 bytes address block
+            assert!(len >= 12);
+
+            let src = IpAddr::V4(Ipv4Addr::new(header[16], header[17], header[18], header[19]));
+            let dst = IpAddr::V4(Ipv4Addr::new(header[20], header[21], header[22], header[23]));
+            let src_port = u16::from_be_bytes([header[24], header[25]]);
+            let dst_port = u16::from_be_bytes([header[26], header[27]]);
+
+            assert_eq!(src, local.ip());
+            assert_eq!(dst, peer.ip());
+            assert_eq!(src_port, local.port());
+            assert_eq!(dst_port, peer.port());
+        }
+        0x21 => {
+            // INET6 + STREAM, minimum 36 bytes address block
+            assert!(len >= 36);
+
+            let mut src_oct = [0u8; 16];
+            let mut dst_oct = [0u8; 16];
+            src_oct.copy_from_slice(&header[16..32]);
+            dst_oct.copy_from_slice(&header[32..48]);
+
+            let src = IpAddr::V6(Ipv6Addr::from(src_oct));
+            let dst = IpAddr::V6(Ipv6Addr::from(dst_oct));
+            let src_port = u16::from_be_bytes([header[48], header[49]]);
+            let dst_port = u16::from_be_bytes([header[50], header[51]]);
+
+            assert_eq!(src, local.ip());
+            assert_eq!(dst, peer.ip());
+            assert_eq!(src_port, local.port());
+            assert_eq!(dst_port, peer.port());
+        }
+        other => panic!("unexpected v2 fam/proto byte: {other:#x}"),
+    }
+}
+
+
 async fn tcp_echo_hitter_expect_proxy_protocol(addr: &'static str) -> Result<()> {
     let conn = TcpStream::connect(addr).await?;
     let local = conn.local_addr()?;
@@ -357,26 +445,32 @@ async fn tcp_echo_hitter_expect_proxy_protocol(addr: &'static str) -> Result<()>
     let (rd, mut wr) = conn.into_split();
     let mut rd = BufReader::new(rd);
 
-    // Read the echoed PROXY header line first.
-    let mut header = String::new();
-    let n = time::timeout(Duration::from_secs(5), rd.read_line(&mut header)).await??;
-    assert!(n > 0, "expected a proxy protocol header line");
+    // Read & validate proxy protocol header (v1 or v2)
+    let header = read_proxy_protocol_header(&mut rd).await?;
 
-    let expected = format!(
-        "PROXY TCP4 {} {} {} {}\r\n",
-        local.ip(),
-        peer.ip(),
-        local.port(),
-        peer.port()
-    );
-    assert_eq!(header, expected);
+    if header.starts_with(b"PROXY ") {
+        // v1 assertion (stringy)
+        let proto = if local.is_ipv4() { "TCP4" } else { "TCP6" };
+        let expected = format!(
+            "PROXY {proto} {} {} {} {}\r\n",
+            local.ip(),
+            peer.ip(),
+            local.port(),
+            peer.port()
+        )
+        .into_bytes();
+        assert_eq!(header, expected);
+    } else {
+        // v2 assertion (binary)
+        assert_proxy_v2_matches(&header, local, peer);
+    }
 
     // Now the stream should behave like a normal echo connection.
     let mut wr_buf = [0u8; 1024];
     let mut rd_buf = [0u8; 1024];
 
     for _ in 0..100 {
-        rand::thread_rng().fill(&mut wr_buf);
+        rand::thread_rng().fill_bytes(&mut wr_buf);
         wr.write_all(&wr_buf).await?;
         rd.read_exact(&mut rd_buf).await?;
         assert_eq!(wr_buf, rd_buf);
@@ -384,3 +478,8 @@ async fn tcp_echo_hitter_expect_proxy_protocol(addr: &'static str) -> Result<()>
 
     Ok(())
 }
+
+
+
+
+

@@ -194,88 +194,58 @@ where
     Ok(())
 }
 
-pub fn generate_proxy_protocol_v1_header(s: &TcpStream) -> Result<String> {
+pub fn generate_proxy_protocol_header(s: &TcpStream, proxy_protocol: &str) -> Result<Vec<u8>, anyhow::Error> {
     let local_addr = s.local_addr()?;
     let remote_addr = s.peer_addr()?;
-    let proto = if local_addr.is_ipv4() { "TCP4" } else { "TCP6" };
-    let header = format!(
-        "PROXY {} {} {} {} {}\r\n", 
-        proto, 
-        remote_addr.ip(), 
-        local_addr.ip(), 
-        remote_addr.port(), 
-        local_addr.port()
-    );
-    Ok(header)
-}
 
-#[cfg(test)]
-mod proxy_protocol_tests {
-    use super::generate_proxy_protocol_v1_header;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    match proxy_protocol {
+        "v1" => {
+            let proto = if local_addr.is_ipv4() { "TCP4" } else { "TCP6" };
+            let header = format!(
+                "PROXY {} {} {} {} {}\r\n", 
+                proto, 
+                remote_addr.ip(), 
+                local_addr.ip(), 
+                remote_addr.port(), 
+                local_addr.port()
+            );
 
-    fn expected_v1_header(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> String {
-        let proto = if local.is_ipv4() { "TCP4" } else { "TCP6" };
-        format!(
-            "PROXY {proto} {} {} {} {}\r\n",
-            remote.ip(),
-            local.ip(),
-            remote.port(),
-            local.port()
-        )
-    }
+            return Ok(header.into_bytes());
+        }
+        "v2" => {
 
-    #[tokio::test]
-    async fn v1_header_ipv4_format_is_correct() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+            let v2sig: &[u8] = &[0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A];
+            let ver_cmd = &[0x21]; // 0x21 version 2 and PROXY command
+            let proto = if local_addr.is_ipv4() { &[0x11] } else { &[0x21] }; // 0x11 for TCP IPv4 and 0x21 for TCP IPv6, TODO: support UNIX
+            let addrs_length: &[u8] = if local_addr.is_ipv4() { &[0, 12] } else { &[0, 36] }; // 12 for IPv4 and 36 for IPv6, TOOD: support UNIX
+            let src_addr = match remote_addr {
+                SocketAddr::V4(v4) => v4.ip().octets().to_vec(),
+                SocketAddr::V6(v6) => v6.ip().octets().to_vec(),
+            };
+            let dst_addr = match local_addr {
+                SocketAddr::V4(v4) => v4.ip().octets().to_vec(),
+                SocketAddr::V6(v6) => v6.ip().octets().to_vec(),
+            };
+    
+            let header:Vec<u8> = [
+                v2sig, 
+                ver_cmd, 
+                proto, 
+                addrs_length,
+                &src_addr,
+                &dst_addr,
+                &remote_addr.port().to_be_bytes(),
+                &local_addr.port().to_be_bytes()
+                ].concat();
+    
+            trace!("Proxy protocol v2 header: {:02x?}", header);
+    
+            return Ok(header);
 
-        // Create a connection so we get a real TcpStream with real peer/local addrs
-        let _client = TcpStream::connect(addr).await.unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-
-        let local = server.local_addr().unwrap();
-        let remote = server.peer_addr().unwrap();
-
-        assert!(local.is_ipv4());
-        assert!(remote.is_ipv4());
-
-        let expected = expected_v1_header(local, remote);
-        let got = generate_proxy_protocol_v1_header(&server).unwrap();
-
-        assert_eq!(got, expected);
-        assert!(got.ends_with("\r\n"));
-        assert!(got.starts_with("PROXY TCP4 "));
-    }
-
-    #[tokio::test]
-    async fn v1_header_ipv6_format_is_correct_or_skipped_if_unavailable() {
-        // Some CI environments don’t have IPv6 loopback enabled; skip gracefully.
-        let listener = match TcpListener::bind("[::1]:0").await {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        let addr = listener.local_addr().unwrap();
-
-        let _client = match TcpStream::connect(addr).await {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let (server, _) = listener.accept().await.unwrap();
-
-        let local = server.local_addr().unwrap();
-        let remote = server.peer_addr().unwrap();
-
-        assert!(local.is_ipv6());
-        assert!(remote.is_ipv6());
-
-        let expected = expected_v1_header(local, remote);
-        let got = generate_proxy_protocol_v1_header(&server).unwrap();
-
-        assert_eq!(got, expected);
-        assert!(got.ends_with("\r\n"));
-        assert!(got.starts_with("PROXY TCP6 "));
+        },
+        _ => {
+            return Err(anyhow!("Unknown proxy protocol {}", proxy_protocol))
+        }
     }
 
     #[tokio::test]

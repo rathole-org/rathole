@@ -131,10 +131,9 @@ p12 = { version = "0.6.3", optional = true }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [build-dependencies]
-vergen = { version = "7.4.2", default-features = false, features = [
+vergen-gitcl = { version = "9.1.0", default-features = false, features = [
     "build",
-    "git",
-    "cargo",
+    "cargo"
 ] }
 anyhow = "1.0"
 

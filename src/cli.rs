@@ -9,7 +9,7 @@ pub enum KeypairType {
 
 lazy_static! {
     static ref VERSION: &'static str =
-        option_env!("VERGEN_GIT_SEMVER_LIGHTWEIGHT").unwrap_or(env!("VERGEN_BUILD_SEMVER"));
+        option_env!("VERGEN_GIT_DESCRIBE").unwrap_or(env!("VERGEN_BUILD_SEMVER"));
     static ref LONG_VERSION: String = format!(
         "
 Build Timestamp:     {}

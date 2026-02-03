@@ -2,15 +2,16 @@ use crate::config::{TlsConfig, TransportConfig};
 use crate::helper::host_port_pair;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use std::fmt::Debug;
-use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::{fs, io};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use p12::PFX;
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 pub(crate) use tokio_rustls::TlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -55,15 +56,28 @@ fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
 }
 
 fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
-    let cert = if let Some(path) = config.trusted_root.as_ref() {
-        rustls_pemfile::certs(&mut std::io::BufReader::new(fs::File::open(path).unwrap()))
-            .map(|cert| cert.unwrap())
+    let cert: CertificateDer<'static> = if let Some(path) = config.trusted_root.as_ref() {
+        // Iterate CERTIFICATE sections from a PEM file and take the first one
+        let mut it = CertificateDer::pem_file_iter(path)
+            .with_context(|| format!("Failed to open/read certificate file: {}", path.display()))?;
+
+        let cert = it
             .next()
-            .with_context(|| "Failed to read certificate")?
+            .transpose()
+            .with_context(|| "Failed to parse certificate PEM")?
+            .with_context(|| "No CERTIFICATE entries found in PEM file")?;
+
+        cert.into_owned()
     } else {
         // read from native
         match rustls_native_certs::load_native_certs() {
-            Ok(certs) => certs.into_iter().next().unwrap(),
+            Ok(certs) => match certs.into_iter().next() {
+                Some(c) => c,
+                None => {
+                    eprintln!("No native certificates found");
+                    return Ok(None);
+                }
+            },
             Err(e) => {
                 eprintln!("Failed to load native certs: {}", e);
                 return Ok(None);
@@ -72,7 +86,9 @@ fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
     };
 
     let mut root_certs = RootCertStore::empty();
-    root_certs.add(cert).unwrap();
+    root_certs
+        .add(cert)
+        .map_err(|e| anyhow::anyhow!("Failed to add certificate to RootCertStore: {e:?}"))?;
 
     Ok(Some(
         ClientConfig::builder()
@@ -94,18 +110,17 @@ impl Transport for TlsTransport {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing tls config"))?;
 
-        let connector = load_client_config(config)
-            .unwrap()
-            .map(|c| Arc::new(c).into());
-        let tls_acceptor = load_server_config(config)
-            .unwrap()
-            .map(|c| Arc::new(c).into());
+        let client_cfg = load_client_config(config)?
+            .ok_or_else(|| anyhow!("TLS client config unavailable (failed to load root certs)"))?;
+
+        let server_cfg = load_server_config(config)?
+            .ok_or_else(|| anyhow!("TLS server config unavailable (failed to load cert/key)"))?;
 
         Ok(TlsTransport {
             tcp,
             config: config.clone(),
-            connector,
-            tls_acceptor,
+            connector: Some(Arc::new(client_cfg).into()),
+            tls_acceptor: Some(Arc::new(server_cfg).into()),
         })
     }
 

@@ -649,12 +649,13 @@ async fn run_tcp_connection_pool<T: Transport>(
                     let proxy_proto = proxy_protocol.clone();
                     tokio::spawn(async move {
                         if !proxy_proto.is_empty() {
-                            let proxy_proto_header = generate_proxy_protocol_header(&visitor, &proxy_proto);
+                            let proxy_proto_header =
+                                generate_proxy_protocol_header(&visitor, &proxy_proto);
                             match proxy_proto_header {
                                 Ok(header) => {
                                     let _ = ch.write_all(&header).await;
                                     let _ = ch.flush().await;
-                                },
+                                }
                                 Err(e) => {
                                     error!("Failed to generate proxy protocol header: {}", e);
                                 }

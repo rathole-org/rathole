@@ -27,7 +27,6 @@ const PP2_SIG: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
 ];
 
-
 #[derive(Clone, Copy, Debug)]
 enum Type {
     Tcp,
@@ -357,7 +356,9 @@ async fn test_proxy_protocol(config_path: &'static str) -> Result<()> {
     Ok(())
 }
 
-async fn read_proxy_protocol_header(rd: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Result<Vec<u8>> {
+async fn read_proxy_protocol_header(
+    rd: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> Result<Vec<u8>> {
     // Read 12 bytes to distinguish v2 signature vs v1 ("PROXY ...")
     let mut first12 = [0u8; 12];
     time::timeout(Duration::from_secs(5), rd.read_exact(&mut first12)).await??;
@@ -403,8 +404,12 @@ fn assert_proxy_v2_matches(header: &[u8], local: SocketAddr, peer: SocketAddr) {
             // INET + STREAM, minimum 12 bytes address block
             assert!(len >= 12);
 
-            let src = IpAddr::V4(Ipv4Addr::new(header[16], header[17], header[18], header[19]));
-            let dst = IpAddr::V4(Ipv4Addr::new(header[20], header[21], header[22], header[23]));
+            let src = IpAddr::V4(Ipv4Addr::new(
+                header[16], header[17], header[18], header[19],
+            ));
+            let dst = IpAddr::V4(Ipv4Addr::new(
+                header[20], header[21], header[22], header[23],
+            ));
             let src_port = u16::from_be_bytes([header[24], header[25]]);
             let dst_port = u16::from_be_bytes([header[26], header[27]]);
 
@@ -435,7 +440,6 @@ fn assert_proxy_v2_matches(header: &[u8], local: SocketAddr, peer: SocketAddr) {
         other => panic!("unexpected v2 fam/proto byte: {other:#x}"),
     }
 }
-
 
 async fn tcp_echo_hitter_expect_proxy_protocol(addr: &'static str) -> Result<()> {
     let conn = TcpStream::connect(addr).await?;
@@ -478,8 +482,3 @@ async fn tcp_echo_hitter_expect_proxy_protocol(addr: &'static str) -> Result<()>
 
     Ok(())
 }
-
-
-
-
-

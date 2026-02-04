@@ -4,15 +4,16 @@ use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::{fs, io};
+use std::fs;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
-
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use p12::PFX;
-use rustls_pki_types::{pem::PemObject, CertificateDer};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+
+
 pub(crate) use tokio_rustls::TlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -57,29 +58,24 @@ fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
 
 fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
     let cert: CertificateDer<'static> = if let Some(path) = config.trusted_root.as_ref() {
-        // Iterate CERTIFICATE sections from a PEM file and take the first one
-        let mut it = CertificateDer::pem_file_iter(path)
-            .with_context(|| format!("Failed to open/read certificate file: {}", path.display()))?;
+        let path = std::path::Path::new(path);
 
-        let cert = it
-            .next()
-            .transpose()
-            .with_context(|| "Failed to parse certificate PEM")?
-            .with_context(|| "No CERTIFICATE entries found in PEM file")?;
-
-        cert.into_owned()
+        CertificateDer::from_pem_file(path)
+            .with_context(|| format!("Failed to read certificate file: {}", path.display()))?
+            .into_owned()
     } else {
-        // read from native
-        match rustls_native_certs::load_native_certs() {
-            Ok(certs) => match certs.into_iter().next() {
-                Some(c) => c,
-                None => {
-                    eprintln!("No native certificates found");
-                    return Ok(None);
-                }
-            },
-            Err(e) => {
-                eprintln!("Failed to load native certs: {}", e);
+        // read from native cert store (rustls-native-certs 0.8.x)
+        let native = rustls_native_certs::load_native_certs();
+
+        // Optional: print diagnostics about any certs that failed to load
+        for err in native.errors.iter() {
+            eprintln!("Failed to load a native cert: {err}");
+        }
+
+        match native.certs.into_iter().next() {
+            Some(c) => c,
+            None => {
+                eprintln!("No native certificates found");
                 return Ok(None);
             }
         }

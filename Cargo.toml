@@ -30,6 +30,7 @@ client = []
 native-tls = ["tokio-native-tls"]
 rustls = [
     "tokio-rustls",
+    "rustls-native-certs",
     "p12",
 ]
 
@@ -120,6 +121,7 @@ futures-core = { version = "0.3.28", optional = true }
 futures-sink = { version = "0.3.28", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }
 tokio-rustls = { version = "0.25", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 p12 = { version = "0.6.3", optional = true }
 
 [target.'cfg(target_env = "musl")'.dependencies]

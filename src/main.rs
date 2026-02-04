@@ -1,8 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
 use rathole::{run, Cli};
-use std::io::{self, IsTerminal};
 use tokio::{signal, sync::broadcast};
+
+#[cfg(not(feature = "console"))]
+use std::io::{self, IsTerminal};
+
 #[cfg(not(feature = "console"))]
 use tracing_subscriber::EnvFilter;
 

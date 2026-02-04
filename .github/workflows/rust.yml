@@ -63,9 +63,9 @@ jobs:
       - name: Build
         run: cargo build
       - name: Run tests with native-tls
-        run: cargo test --verbose
+        run: cargo test --verbose -- --test-threads=1
       - name: Run tests with rustls
-        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
+        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload -- --test-threads=1
       - uses: actions/upload-artifact@v4
         with:
           name: rathole-${{ matrix.target }}

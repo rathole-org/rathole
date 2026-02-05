@@ -1,0 +1,237 @@
+name: Dev build (binaries + docker)
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+
+concurrency:
+  group: dev-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+env:
+  RELEASE_TAG: dev-latest
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+
+  build-binaries:
+    name: Build binaries (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: rathole
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: rathole.exe
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            bin: rathole
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            bin: rathole
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          rustflags: ""
+      - name: Build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo build --release --locked --bin rathole
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out dist
+          cp "target/release/${{ matrix.bin }}" dist/
+          tar -czf "out/rathole-dev-${{ matrix.target }}.tar.gz" -C dist .
+          ls -lah out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: out/rathole-dev-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+
+  docker:
+    name: Build & push docker (dev)
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=dev
+            type=sha,format=short,prefix=dev-
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: Update rolling dev release
+    runs-on: ubuntu-latest
+    needs: [build-binaries, docker]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        shell: bash
+        run: git fetch --tags --force
+
+      - name: Remember previous dev tag (if exists)
+        id: prev
+        shell: bash
+        run: |
+          set -e
+          if git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            echo "sha=$(git rev-parse refs/tags/${RELEASE_TAG})" >> $GITHUB_OUTPUT
+          else
+            echo "sha=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Move dev tag to this commit (and update prev tag)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PREV_TAG="${RELEASE_TAG}-prev"
+          OLD_SHA="${{ steps.prev.outputs.sha }}"
+
+          if [[ -n "${OLD_SHA}" ]]; then
+            git tag -f "${PREV_TAG}" "${OLD_SHA}"
+
+            if ! git push -f origin "refs/tags/${PREV_TAG}" 2>push_prev.err; then
+              if grep -q "refusing to allow a GitHub App to create or update workflow" push_prev.err; then
+                echo "::warning::Could not update ${PREV_TAG} because ${OLD_SHA} modifies .github/workflows/. Continuing without previous_tag_name this run."
+                # Remove the local tag so later steps don't mistakenly think it exists remotely
+                git tag -d "${PREV_TAG}" || true
+              else
+                echo "Unexpected failure pushing ${PREV_TAG}:"
+                cat push_prev.err
+                exit 1
+              fi
+            fi
+          fi
+
+          git tag -f "${RELEASE_TAG}" "${GITHUB_SHA}"
+          git push -f origin "refs/tags/${RELEASE_TAG}"
+
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "bin-*"
+          merge-multiple: true
+
+      - name: Generate PR-based notes + Update Release + upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKER_DIGEST: ${{ needs.docker.outputs.digest }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY}"
+          PREV_TAG="${RELEASE_TAG}-prev"
+
+          ARGS=(-f tag_name="${RELEASE_TAG}" -f target_commitish="${GITHUB_SHA}")
+          if git ls-remote --tags origin "refs/tags/${PREV_TAG}" | grep -q .; then
+            ARGS+=(-f previous_tag_name="${PREV_TAG}")
+          fi
+
+          GEN_NOTES="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            "${ARGS[@]}" \
+            --jq '.body'
+          )"
+
+          cat > RELEASE_NOTES.md <<EOF
+          Automated build from branch \`dev\`.
+
+          - Commit: \`${GITHUB_SHA}\`
+          - Docker:
+            - \`${IMAGE}:dev\` (moving)
+            - \`${IMAGE}:dev-${SHORT_SHA}\` (pinned tag)
+            - \`${IMAGE}@${DOCKER_DIGEST}\` (pinned digest)
+
+          Pull:
+          \`\`\`bash
+          docker pull ${IMAGE}:dev
+          docker pull ${IMAGE}:dev-${SHORT_SHA}
+          docker pull ${IMAGE}@${DOCKER_DIGEST}
+          \`\`\`
+
+          ---
+
+          ${GEN_NOTES}
+          EOF
+
+          TITLE="Dev build (${SHORT_SHA})"
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --prerelease \
+              --title "${TITLE}" \
+              --notes-file RELEASE_NOTES.md
+          else
+            gh release create "${RELEASE_TAG}" \
+              --prerelease \
+              --title "${TITLE}" \
+              --notes-file RELEASE_NOTES.md
+          fi
+
+          mapfile -t FILES < <(find dist -type f -name '*.tar.gz' -print)
+          if (( ${#FILES[@]} == 0 )); then
+            echo "No *.tar.gz artifacts found under dist/"
+            find dist -maxdepth 3 -type f -print || true
+            exit 1
+          fi
+          gh release upload "${RELEASE_TAG}" "${FILES[@]}" --clobber
+
+

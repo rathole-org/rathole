@@ -1,0 +1,25 @@
+[client]
+remote_addr = "127.0.0.1:2333"
+default_token = "default_token_if_not_specify"
+
+[client.transport]
+type = "tcp"
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+[client.services.pingpong]
+local_addr = "127.0.0.1:8081"
+
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "default_token_if_not_specify"
+
+[server.transport]
+type = "tcp"
+
+[server.services.echo]
+bind_addr = "0.0.0.0:2334"
+proxy_protocol = "v2"
+
+[server.services.pingpong]
+bind_addr = "0.0.0.0:2335"

@@ -1,0 +1,14 @@
+# rathole configuration with Proxy Protocol enabled.
+#
+# Each service can optionally set `proxy_protocol` to:
+#   - "v1" (human-readable line)
+#   - "v2" (binary header)
+# If omitted, Proxy Protocol is disabled for that service.
+
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "123"
+
+[server.services.foo1]
+bind_addr = "0.0.0.0:5202"
+proxy_protocol = "v2"

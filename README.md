@@ -171,6 +171,7 @@ type = "tcp" # Optional. Same as the client `[client.services.X.type]
 token = "whatever" # Necessary if `server.default_token` not set
 bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
 nodelay = true # Optional. Same as the client
+proxy_protocol = "v2" # Optional. Prepend HAProxy PROXY protocol header to each incoming TCP connection before forwarding to the client. Possible values: ["v1", "v2"]. Default: disabled (unset). Only applies to TCP services.
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"

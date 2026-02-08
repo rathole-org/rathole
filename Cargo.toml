@@ -121,7 +121,7 @@ futures-core = { version = "0.3.28", optional = true }
 futures-sink = { version = "0.3.28", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }
 tokio-rustls = { version = "0.25", optional = true }
-rustls-native-certs = { version = "0.8", optional = true }
+rustls-native-certs = { version = "0.8.3", optional = true }
 p12 = { version = "0.6.3", optional = true }
 
 [target.'cfg(target_env = "musl")'.dependencies]
@@ -133,4 +133,3 @@ vergen-gitcl = { version = "9.1.0", default-features = false, features = [
     "cargo"
 ] }
 anyhow = "1.0"
-

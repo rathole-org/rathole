@@ -1,20 +1,21 @@
 use crate::config::{TlsConfig, TransportConfig};
 use crate::helper::host_port_pair;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
-use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
-use p12::PFX;
 use std::fmt::Debug;
 use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
-
 pub(crate) use tokio_rustls::TlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use p12::PFX;
 
 pub struct TlsTransport {
     tcp: TcpTransport,
@@ -56,34 +57,48 @@ fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
 }
 
 fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
-    let cert: CertificateDer<'static> = if let Some(path) = config.trusted_root.as_ref() {
-        let path = std::path::Path::new(path);
+    let mut root_certs = RootCertStore::empty();
 
-        CertificateDer::from_pem_file(path)
-            .with_context(|| format!("Failed to read certificate file: {}", path.display()))?
-            .into_owned()
+    if let Some(path) = config.trusted_root.as_deref() {
+        // Parse CERTIFICATE blocks from PEM using rustls-pki-types
+        let iter = CertificateDer::pem_file_iter(path).with_context(|| {
+            format!(
+                "Failed to open/read certificate file {}",
+                Path::new(path).display()
+            )
+        })?;
+
+        let mut added_any = false;
+        for cert in iter {
+            let cert = cert?; // pem::Error -> anyhow
+            root_certs.add(cert.into_owned())?; // add expects owned DER
+            added_any = true;
+        }
+
+        if !added_any {
+            anyhow::bail!(
+                "No CERTIFICATE entries found in PEM file {}",
+                Path::new(path).display()
+            );
+        }
     } else {
-        // read from native cert store (rustls-native-certs 0.8.x)
+        // New rustls-native-certs API: CertificateResult { certs, errors }
         let native = rustls_native_certs::load_native_certs();
 
-        // Optional: print diagnostics about any certs that failed to load
-        for err in native.errors.iter() {
-            eprintln!("Failed to load a native cert: {err}");
+        for err in &native.errors {
+            eprintln!("Failed to load some native certs: {err}");
         }
 
-        match native.certs.into_iter().next() {
-            Some(c) => c,
-            None => {
-                eprintln!("No native certificates found");
-                return Ok(None);
-            }
+        if native.certs.is_empty() {
+            // allow missing client root_certs (old behaviour)
+            return Ok(None);
         }
-    };
 
-    let mut root_certs = RootCertStore::empty();
-    root_certs
-        .add(cert)
-        .map_err(|e| anyhow::anyhow!("Failed to add certificate to RootCertStore: {e:?}"))?;
+        for cert in native.certs {
+            // Some certs may fail parsing into the store
+            root_certs.add(cert).context("Failed to add native cert")?;
+        }
+    }
 
     Ok(Some(
         ClientConfig::builder()
@@ -105,17 +120,18 @@ impl Transport for TlsTransport {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing tls config"))?;
 
-        let client_cfg = load_client_config(config)?
-            .ok_or_else(|| anyhow!("TLS client config unavailable (failed to load root certs)"))?;
-
-        let server_cfg = load_server_config(config)?
-            .ok_or_else(|| anyhow!("TLS server config unavailable (failed to load cert/key)"))?;
+        let connector = load_client_config(config)
+            .unwrap()
+            .map(|c| Arc::new(c).into());
+        let tls_acceptor = load_server_config(config)
+            .unwrap()
+            .map(|c| Arc::new(c).into());
 
         Ok(TlsTransport {
             tcp,
             config: config.clone(),
-            connector: Some(Arc::new(client_cfg).into()),
-            tls_acceptor: Some(Arc::new(server_cfg).into()),
+            connector,
+            tls_acceptor,
         })
     }
 

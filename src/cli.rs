@@ -50,7 +50,7 @@ pub struct Cli {
     ///
     /// Running as a client or a server is automatically determined
     /// according to the configuration file.
-    #[arg(value_name = "CONFIG")]
+    #[arg(id = "CONFIG", value_name = "CONFIG")]
     pub config_path: Option<std::path::PathBuf>,
 
     /// Run as a server
@@ -72,4 +72,15 @@ pub struct Cli {
         default_missing_value = "x25519"
     )]
     pub genkey: Option<Option<KeypairType>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_is_valid() {
+        Cli::command().debug_assert();
+    }
 }

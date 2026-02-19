@@ -65,7 +65,6 @@ pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
 
 /// Create a UDP socket and connect to `addr`
 pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result<UdpSocket> {
-
     let (socket_addr, bind_addr);
 
     match prefer_ipv6 {
@@ -76,7 +75,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                 SocketAddr::V4(_) => "0.0.0.0:0",
                 SocketAddr::V6(_) => ":::0",
             };
-        },
+        }
         true => {
             let all_host_addresses: Vec<SocketAddr> = lookup_host(addr).await?.collect();
 
@@ -85,7 +84,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                 Some(socket_addr_ipv6) => {
                     socket_addr = *socket_addr_ipv6;
                     bind_addr = ":::0";
-                },
+                }
                 None => {
                     let socket_addr_ipv4 = all_host_addresses.iter().find(|x| x.is_ipv4());
                     match socket_addr_ipv4 {
@@ -194,7 +193,10 @@ where
     Ok(())
 }
 
-pub fn generate_proxy_protocol_header(s: &TcpStream, proxy_protocol: &str) -> Result<Vec<u8>, anyhow::Error> {
+pub fn generate_proxy_protocol_header(
+    s: &TcpStream,
+    proxy_protocol: &str,
+) -> Result<Vec<u8>, anyhow::Error> {
     let local_addr = s.local_addr()?;
     let remote_addr = s.peer_addr()?;
 
@@ -202,22 +204,31 @@ pub fn generate_proxy_protocol_header(s: &TcpStream, proxy_protocol: &str) -> Re
         "v1" => {
             let proto = if local_addr.is_ipv4() { "TCP4" } else { "TCP6" };
             let header = format!(
-                "PROXY {} {} {} {} {}\r\n", 
-                proto, 
-                remote_addr.ip(), 
-                local_addr.ip(), 
-                remote_addr.port(), 
+                "PROXY {} {} {} {} {}\r\n",
+                proto,
+                remote_addr.ip(),
+                local_addr.ip(),
+                remote_addr.port(),
                 local_addr.port()
             );
 
             Ok(header.into_bytes())
         }
         "v2" => {
-
-            let v2sig: &[u8] = &[0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A];
+            let v2sig: &[u8] = &[
+                0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+            ];
             let ver_cmd = &[0x21]; // 0x21 version 2 and PROXY command
-            let proto = if local_addr.is_ipv4() { &[0x11] } else { &[0x21] }; // 0x11 for TCP IPv4 and 0x21 for TCP IPv6, TODO: support UNIX
-            let addrs_length: &[u8] = if local_addr.is_ipv4() { &[0, 12] } else { &[0, 36] }; // 12 for IPv4 and 36 for IPv6, TOOD: support UNIX
+            let proto = if local_addr.is_ipv4() {
+                &[0x11]
+            } else {
+                &[0x21]
+            }; // 0x11 for TCP IPv4 and 0x21 for TCP IPv6, TODO: support UNIX
+            let addrs_length: &[u8] = if local_addr.is_ipv4() {
+                &[0, 12]
+            } else {
+                &[0, 36]
+            }; // 12 for IPv4 and 36 for IPv6, TOOD: support UNIX
             let src_addr = match remote_addr {
                 SocketAddr::V4(v4) => v4.ip().octets().to_vec(),
                 SocketAddr::V6(v6) => v6.ip().octets().to_vec(),
@@ -226,28 +237,25 @@ pub fn generate_proxy_protocol_header(s: &TcpStream, proxy_protocol: &str) -> Re
                 SocketAddr::V4(v4) => v4.ip().octets().to_vec(),
                 SocketAddr::V6(v6) => v6.ip().octets().to_vec(),
             };
-    
-            let header:Vec<u8> = [
-                v2sig, 
-                ver_cmd, 
-                proto, 
+
+            let header: Vec<u8> = [
+                v2sig,
+                ver_cmd,
+                proto,
                 addrs_length,
                 &src_addr,
                 &dst_addr,
                 &remote_addr.port().to_be_bytes(),
-                &local_addr.port().to_be_bytes()
-                ].concat();
-    
+                &local_addr.port().to_be_bytes(),
+            ]
+            .concat();
+
             trace!("Proxy protocol v2 header: {:02x?}", header);
-    
+
             Ok(header)
-
-        },
-        _ => {
-            Err(anyhow!("Unknown proxy protocol {}", proxy_protocol))
         }
+        _ => Err(anyhow!("Unknown proxy protocol {}", proxy_protocol)),
     }
-
 }
 
 #[cfg(test)]

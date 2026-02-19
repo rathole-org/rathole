@@ -4,16 +4,18 @@ use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use std::fmt::Debug;
 use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+pub(crate) use tokio_rustls::TlsStream;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use p12::PFX;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
-pub(crate) use tokio_rustls::TlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 pub struct TlsTransport {
     tcp: TcpTransport,
@@ -55,24 +57,48 @@ fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
 }
 
 fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
-    let cert = if let Some(path) = config.trusted_root.as_ref() {
-        rustls_pemfile::certs(&mut std::io::BufReader::new(fs::File::open(path).unwrap()))
-            .map(|cert| cert.unwrap())
-            .next()
-            .with_context(|| "Failed to read certificate")?
-    } else {
-        // read from native
-        match rustls_native_certs::load_native_certs() {
-            Ok(certs) => certs.into_iter().next().unwrap(),
-            Err(e) => {
-                eprintln!("Failed to load native certs: {}", e);
-                return Ok(None);
-            }
-        }
-    };
-
     let mut root_certs = RootCertStore::empty();
-    root_certs.add(cert).unwrap();
+
+    if let Some(path) = config.trusted_root.as_deref() {
+        // Parse CERTIFICATE blocks from PEM using rustls-pki-types
+        let iter = CertificateDer::pem_file_iter(path).with_context(|| {
+            format!(
+                "Failed to open/read certificate file {}",
+                Path::new(path).display()
+            )
+        })?;
+
+        let mut added_any = false;
+        for cert in iter {
+            let cert = cert?; // pem::Error -> anyhow
+            root_certs.add(cert.into_owned())?; // add expects owned DER
+            added_any = true;
+        }
+
+        if !added_any {
+            anyhow::bail!(
+                "No CERTIFICATE entries found in PEM file {}",
+                Path::new(path).display()
+            );
+        }
+    } else {
+        // New rustls-native-certs API: CertificateResult { certs, errors }
+        let native = rustls_native_certs::load_native_certs();
+
+        for err in &native.errors {
+            eprintln!("Failed to load some native certs: {err}");
+        }
+
+        if native.certs.is_empty() {
+            // allow missing client root_certs (old behaviour)
+            return Ok(None);
+        }
+
+        for cert in native.certs {
+            // Some certs may fail parsing into the store
+            root_certs.add(cert).context("Failed to add native cert")?;
+        }
+    }
 
     Ok(Some(
         ClientConfig::builder()

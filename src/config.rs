@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::IntoDeserializer;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
@@ -79,7 +80,7 @@ impl ClientServiceConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ServiceType {
     #[serde(rename = "tcp")]
     #[default]
@@ -89,6 +90,41 @@ pub enum ServiceType {
     #[cfg(unix)]
     #[serde(rename = "socket_stream")]
     SocketStream,
+}
+
+impl<'de> Deserialize<'de> for ServiceType {
+    // Custom deserialization to provide better error messages and handle platform-specific variants
+    // this is necessary because the `socket_stream` variant is only supported on Unix-like systems
+    // and we want to provide a clear error message if someone tries to use it on an unsupported platform
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "tcp" => Ok(ServiceType::Tcp),
+            "udp" => Ok(ServiceType::Udp),
+            "socket_stream" => {
+                #[cfg(unix)]
+                {
+                    Ok(ServiceType::SocketStream)
+                }
+                #[cfg(not(unix))]
+                {
+                    Err(serde::de::Error::custom(
+                        "The `socket_stream` service type is only supported on Unix-like systems",
+                    ))
+                }
+            }
+            _ => Err(serde::de::Error::unknown_variant(
+                &s,
+                #[cfg(unix)]
+                &["tcp", "udp", "socket_stream"],
+                #[cfg(not(unix))]
+                &["tcp", "udp"],
+            )),
+        }
+    }
 }
 
 fn default_service_type() -> ServiceType {

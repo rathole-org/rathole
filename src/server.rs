@@ -667,8 +667,10 @@ fn socket_stream_listen_and_send(
 
     tokio::spawn(async move {
         let l = retry_notify_with_deadline(listen_backoff(),  || async {
-            if Path::new(&addr).exists() {
-                std::fs::remove_file(&addr).unwrap_or_else(|_| error!("Failed to delete stale socket file {}", &addr));
+            if let Ok(exists) = Path::new(&addr).try_exists() {
+                if exists {
+                    std::fs::remove_file(&addr).unwrap_or_else(|_| error!("Failed to delete stale socket file {}", &addr));
+                };
             };
             Ok(UnixListener::bind(&addr)?)
         }, |e, duration| {
@@ -712,7 +714,7 @@ fn socket_stream_listen_and_send(
                         }
                         Ok((incoming, addr)) => {
                             // For every visitor, request to create a data channel
-                            if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
+                            if data_ch_req_tx.send(true).with_context(|| "Failed to send data channel create request").is_err() {
                                 // An error indicates the control channel is broken
                                 // So break the loop
                                 break;
@@ -728,12 +730,18 @@ fn socket_stream_listen_and_send(
                     }
                 },
                 _ = shutdown_rx.recv() => {
+                    // cleanup the socket file for SocketStream service
+                    if let Ok(exists) = Path::new(&addr).try_exists() {
+                        if exists {
+                            std::fs::remove_file(&addr).unwrap_or_else(|_| error!("Failed to delete socket file {}", &addr));
+                        };
+                    };
                     break;
                 }
             }
         }
 
-        info!("TCPListener shutdown");
+        info!("SocketStreamListener shutdown");
     }.instrument(Span::current()));
 
     rx

@@ -177,6 +177,9 @@ proxy_protocol = "v2" # Optional. Prepend HAProxy PROXY protocol header to each 
 bind_addr = "0.0.0.1:8082"
 ```
 
+### `socket_stream` service type
+`socket_stream` is a service type that is designed for forwarding unix domain sockets. It is only supported on Unix-like systems (Linux, macOS, etc.). The `local_addr` and `bind_addr` of a `socket_stream` service must be a valid path of a unix domain socket, like `/var/run/socket.sock`.
+
 ### Logging
 
 `rathole`, like many other Rust programs, use environment variables to control the logging level. `info`, `warn`, `error`, `debug`, `trace` are available.

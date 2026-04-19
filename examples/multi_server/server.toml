@@ -1,0 +1,11 @@
+# Each rathole server hosts only the services it is responsible for. The
+# client config in `client.toml` points each service at one of these
+# servers via its own `remote_addr`. Service names must match exactly
+# between the client and the corresponding server.
+
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "123"
+
+[server.services.svc_primary]
+bind_addr = "0.0.0.0:5202"

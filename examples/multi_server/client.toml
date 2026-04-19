@@ -1,0 +1,27 @@
+# A single rathole client tunneling different services to different servers.
+#
+# `[client].remote_addr` is the default — services that don't override it
+# will use it. Each service can also set its own `remote_addr`, in which
+# case that service's control + data channels go to that specific server.
+#
+# All services share the same `[client.transport]` block (and any
+# transport-level credentials), so every reachable server must speak the
+# same transport protocol.
+
+[client]
+remote_addr = "primary.example.com:2333"   # default for services that don't override
+default_token = "123"
+
+# Forwarded through the default `primary.example.com` server.
+[client.services.svc_primary]
+local_addr = "127.0.0.1:8080"
+
+# Forwarded through a different server in another region.
+[client.services.svc_eu]
+remote_addr = "eu.example.com:2333"
+local_addr = "127.0.0.1:8081"
+
+# Yet another server, no global default needed for this service.
+[client.services.svc_us]
+remote_addr = "us.example.com:2333"
+local_addr = "127.0.0.1:8082"

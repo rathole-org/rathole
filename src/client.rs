@@ -110,9 +110,13 @@ impl<T: 'static + Transport> Client<T> {
     ) -> Result<()> {
         for (name, config) in &self.config.services {
             // Create a control channel for each service defined
+            let remote_addr = config
+                .remote_addr
+                .clone()
+                .expect("remote_addr resolved by Config::validate_client_config");
             let handle = ControlChannelHandle::new(
                 (*config).clone(),
-                self.config.remote_addr.clone(),
+                remote_addr,
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
             );
@@ -152,9 +156,13 @@ impl<T: 'static + Transport> Client<T> {
             ConfigChange::ClientChange(client_change) => match client_change {
                 ClientServiceChange::Add(cfg) => {
                     let name = cfg.name.clone();
+                    let remote_addr = cfg
+                        .remote_addr
+                        .clone()
+                        .expect("remote_addr resolved by Config::validate_client_config");
                     let handle = ControlChannelHandle::new(
                         cfg,
-                        self.config.remote_addr.clone(),
+                        remote_addr,
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
                     );

@@ -6,6 +6,7 @@ use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
     DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
 };
+use crate::forward::forward_bidirectional_with_idle_timeout;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -15,7 +16,7 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
@@ -83,6 +84,18 @@ pub async fn run_client(
 type ServiceDigest = protocol::Digest;
 type Nonce = protocol::Digest;
 
+// Surface the outcome of a forwarder task. Only the leak-guard reaper
+// (the typed `PostHalfCloseIdleTimeout` sentinel) is debug-level; generic
+// `TimedOut` from a transport could indicate a real handshake / keepalive
+// problem and stays at warn.
+fn log_forwarder_outcome(kind: &'static str, e: &io::Error) {
+    if crate::forward::is_post_half_close_idle_timeout(e) {
+        debug!("Forwarder ({}) reaped by post-half-close idle timeout", kind);
+    } else {
+        warn!("Forwarder ({}) ended with error: {}", kind, e);
+    }
+}
+
 // Holds the state of a client
 struct Client<T: Transport> {
     config: ClientConfig,
@@ -115,6 +128,7 @@ impl<T: 'static + Transport> Client<T> {
                 self.config.remote_addr.clone(),
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
+                self.config.post_half_close_idle_timeout.as_duration(),
             );
             self.service_handles.insert(name.clone(), handle);
         }
@@ -157,6 +171,7 @@ impl<T: 'static + Transport> Client<T> {
                         self.config.remote_addr.clone(),
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
+                        self.config.post_half_close_idle_timeout.as_duration(),
                     );
                     let _ = self.service_handles.insert(name, handle);
                 }
@@ -175,6 +190,7 @@ struct RunDataChannelArgs<T: Transport> {
     connector: Arc<T>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
+    post_half_close_idle_timeout: Option<Duration>,
 }
 
 async fn do_data_channel_handshake<T: Transport>(
@@ -224,7 +240,12 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            run_data_channel_for_tcp::<T>(conn, &args.service.local_addr).await?;
+            run_data_channel_for_tcp::<T>(
+                conn,
+                &args.service.local_addr,
+                args.post_half_close_idle_timeout,
+            )
+            .await?;
         }
         DataChannelCmd::StartForwardUdp => {
             if args.service.service_type != ServiceType::Udp {
@@ -238,23 +259,33 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::SocketStream {
                 bail!("Expect SocketStream traffic. Please check the configuration.")
             }
-            run_data_channel_for_socket_stream::<T>(conn, &args.service.local_addr).await?;
+            run_data_channel_for_socket_stream::<T>(
+                conn,
+                &args.service.local_addr,
+                args.post_half_close_idle_timeout,
+            )
+            .await?;
         }
     }
     Ok(())
 }
 
-// Simply copying back and forth for TCP
+// Two-phase bidirectional forwarding for TCP. See `crate::forward`.
 #[instrument(skip(conn))]
 async fn run_data_channel_for_tcp<T: Transport>(
-    mut conn: T::Stream,
+    conn: T::Stream,
     local_addr: &str,
+    post_half_close_idle_timeout: Option<Duration>,
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
-    let mut local = TcpStream::connect(local_addr)
+    let local = TcpStream::connect(local_addr)
         .await
         .with_context(|| format!("Failed to connect to {}", local_addr))?;
-    let _ = copy_bidirectional(&mut conn, &mut local).await;
+    if let Err(e) =
+        forward_bidirectional_with_idle_timeout(conn, local, post_half_close_idle_timeout).await
+    {
+        log_forwarder_outcome("tcp", &e);
+    }
     Ok(())
 }
 
@@ -347,15 +378,20 @@ async fn run_data_channel_for_udp<T: Transport>(
 
 #[cfg(unix)]
 async fn run_data_channel_for_socket_stream<T: Transport>(
-    mut conn: T::Stream,
+    conn: T::Stream,
     local_addr: &str,
+    post_half_close_idle_timeout: Option<Duration>,
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
 
-    let mut local = UnixStream::connect(local_addr)
+    let local = UnixStream::connect(local_addr)
         .await
         .with_context(|| format!("Failed to connect to {}", local_addr))?;
-    let _ = copy_bidirectional(&mut conn, &mut local).await;
+    if let Err(e) =
+        forward_bidirectional_with_idle_timeout(conn, local, post_half_close_idle_timeout).await
+    {
+        log_forwarder_outcome("socket_stream", &e);
+    }
     Ok(())
 }
 
@@ -420,6 +456,7 @@ struct ControlChannel<T: Transport> {
     remote_addr: String,                // `client.remote_addr`
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
+    post_half_close_idle_timeout: Option<Duration>,
 }
 
 // Handle of a control channel
@@ -489,6 +526,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             connector: self.transport.clone(),
             socket_opts,
             service: self.service.clone(),
+            post_half_close_idle_timeout: self.post_half_close_idle_timeout,
         });
 
         loop {
@@ -529,6 +567,7 @@ impl ControlChannelHandle {
         remote_addr: String,
         transport: Arc<T>,
         heartbeat_timeout: u64,
+        post_half_close_idle_timeout: Option<Duration>,
     ) -> ControlChannelHandle {
         let digest = protocol::digest(service.name.as_bytes());
 
@@ -544,6 +583,7 @@ impl ControlChannelHandle {
             remote_addr,
             transport,
             heartbeat_timeout,
+            post_half_close_idle_timeout,
         };
 
         tokio::spawn(

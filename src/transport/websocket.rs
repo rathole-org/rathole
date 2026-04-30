@@ -95,16 +95,34 @@ impl Stream for StreamWrapper {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(Error::other(err)))),
-            Poll::Ready(Some(Ok(res))) => {
-                if let Message::Binary(b) = res {
-                    Poll::Ready(Some(Ok(Bytes::from(b))))
-                } else {
-                    Poll::Ready(Some(Err(Error::new(
-                        ErrorKind::InvalidData,
-                        "unexpected frame",
-                    ))))
-                }
-            }
+            Poll::Ready(Some(Ok(res))) => match res {
+                Message::Binary(b) => Poll::Ready(Some(Ok(Bytes::from(b)))),
+                // The peer sent a Close frame (the WebSocket protocol's
+                // equivalent of TCP FIN). Surface it as a clean stream end
+                // so the bidirectional forwarder treats it as EOF rather
+                // than as a transport error that would tear the reverse
+                // direction down.
+                //
+                // TODO: drive the queued Close reply to completion.
+                // tungstenite queues an outgoing Close reply when it
+                // observes an inbound Close, and that reply is only
+                // flushed when the sibling write half eventually reaches
+                // `poll_close`. If the surviving direction is reaped by
+                // the post-half-close idle timeout instead, the reply is
+                // dropped on `WriteHalf::drop`. The peer then observes an
+                // abnormal close (RFC 6455 §7.1.5) instead of a clean
+                // close-handshake, and any client / proxy that applies a
+                // long WebSocket close-timeout will hold its resources
+                // until that timer fires. This is a protocol-cleanliness
+                // issue, not data loss. Driving `poll_flush` here would
+                // require sharing the inner `WebSocketStream` between
+                // the split halves, which is structural work.
+                Message::Close(_) => Poll::Ready(None),
+                _ => Poll::Ready(Some(Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "unexpected frame",
+                )))),
+            },
         }
     }
 

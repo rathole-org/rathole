@@ -1,0 +1,35 @@
+[client]
+remote_addr = "127.0.0.1:3333"
+default_token = "default_token_if_not_specify"
+post_half_close_idle_timeout = 1 # 1s keeps the 5s stuck-peer assertion fast
+
+[client.transport]
+type = "websocket"
+[client.transport.tls]
+trusted_root = "examples/tls/rootCA.crt"
+hostname = "localhost"
+[client.transport.websocket]
+tls = true
+
+[client.services.delayed_response]
+local_addr = "127.0.0.1:9080"
+[client.services.sinkhole]
+local_addr = "127.0.0.1:9081"
+
+[server]
+bind_addr = "0.0.0.0:3333"
+default_token = "default_token_if_not_specify"
+post_half_close_idle_timeout = 1 # 1s keeps the 5s stuck-peer assertion fast
+
+[server.transport]
+type = "websocket"
+[server.transport.tls]
+pkcs12 = "examples/tls/identity.pfx"
+pkcs12_password = "1234"
+[server.transport.websocket]
+tls = true
+
+[server.services.delayed_response]
+bind_addr = "0.0.0.0:3334"
+[server.services.sinkhole]
+bind_addr = "0.0.0.0:3335"

@@ -2,18 +2,20 @@ use crate::{
     config::{ClientConfig, ClientServiceConfig, ServerConfig, ServerServiceConfig},
     Config,
 };
-use anyhow::{Context, Result};
-use std::{
-    collections::HashMap,
-    env,
-    path::{Path, PathBuf},
-};
+use anyhow::Result;
+use std::{collections::HashMap, path::{Path, PathBuf}};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, instrument};
 
 #[cfg(feature = "notify")]
+use anyhow::Context;
+#[cfg(feature = "notify")]
+use std::env;
+#[cfg(feature = "notify")]
 use notify::{EventKind, RecursiveMode, Watcher};
+#[cfg(feature = "notify")]
+use tracing::{error, info, instrument};
 
+#[cfg_attr(not(any(test, feature = "notify")), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ConfigChange {
     General(Box<Config>), // Trigger a full restart
@@ -21,18 +23,21 @@ pub enum ConfigChange {
     ClientChange(ClientServiceChange),
 }
 
+#[cfg_attr(not(any(test, feature = "notify")), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ClientServiceChange {
     Add(ClientServiceConfig),
     Delete(String),
 }
 
+#[cfg_attr(not(any(test, feature = "notify")), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ServerServiceChange {
     Add(ServerServiceConfig),
     Delete(String),
 }
 
+#[cfg_attr(not(any(test, feature = "notify")), allow(dead_code))]
 trait InstanceConfig: Clone {
     type ServiceConfig: PartialEq + Eq + Clone;
     fn equal_without_service(&self, rhs: &Self) -> bool;
@@ -199,6 +204,7 @@ async fn config_watcher(
     Ok(())
 }
 
+#[cfg_attr(not(any(test, feature = "notify")), allow(dead_code))]
 fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
     if old == new {
         return None;
@@ -236,6 +242,7 @@ fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
 }
 
 // None indicates a General change needed
+#[cfg_attr(not(any(test, feature = "notify")), allow(dead_code))]
 fn calculate_instance_config_events<T: InstanceConfig>(
     old: &T,
     new: &T,

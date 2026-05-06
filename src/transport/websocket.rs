@@ -6,7 +6,7 @@ use std::task::{ready, Context, Poll};
 
 use super::{AddrMaybeCached, SocketOpts, TcpTransport, TlsTransport, Transport};
 use crate::config::TransportConfig;
-use anyhow::anyhow;
+use anyhow::{anyhow, Context as _};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::stream::Stream;
@@ -27,14 +27,14 @@ use url::Url;
 #[derive(Debug)]
 enum TransportStream {
     Insecure(TcpStream),
-    Secure(TlsStream<TcpStream>),
+    Secure(Box<TlsStream<TcpStream>>),
 }
 
 impl TransportStream {
     fn get_tcpstream(&self) -> &TcpStream {
         match self {
             TransportStream::Insecure(s) => s,
-            TransportStream::Secure(s) => get_tcpstream(s),
+            TransportStream::Secure(s) => get_tcpstream(s.as_ref()),
         }
     }
 }
@@ -47,7 +47,7 @@ impl AsyncRead for TransportStream {
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             TransportStream::Insecure(s) => Pin::new(s).poll_read(cx, buf),
-            TransportStream::Secure(s) => Pin::new(s).poll_read(cx, buf),
+            TransportStream::Secure(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -60,14 +60,14 @@ impl AsyncWrite for TransportStream {
     ) -> Poll<Result<usize, std::io::Error>> {
         match self.get_mut() {
             TransportStream::Insecure(s) => Pin::new(s).poll_write(cx, buf),
-            TransportStream::Secure(s) => Pin::new(s).poll_write(cx, buf),
+            TransportStream::Secure(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
             TransportStream::Insecure(s) => Pin::new(s).poll_flush(cx),
-            TransportStream::Secure(s) => Pin::new(s).poll_flush(cx),
+            TransportStream::Secure(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
@@ -77,7 +77,7 @@ impl AsyncWrite for TransportStream {
     ) -> Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
             TransportStream::Insecure(s) => Pin::new(s).poll_shutdown(cx),
-            TransportStream::Secure(s) => Pin::new(s).poll_shutdown(cx),
+            TransportStream::Secure(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -94,12 +94,10 @@ impl Stream for StreamWrapper {
         match Pin::new(&mut self.get_mut().inner).poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Err(err))) => {
-                Poll::Ready(Some(Err(Error::new(ErrorKind::Other, err))))
-            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(Error::other(err)))),
             Poll::Ready(Some(Ok(res))) => {
                 if let Message::Binary(b) = res {
-                    Poll::Ready(Some(Ok(Bytes::from(b))))
+                    Poll::Ready(Some(Ok(b)))
                 } else {
                     Poll::Ready(Some(Err(Error::new(
                         ErrorKind::InvalidData,
@@ -149,24 +147,24 @@ impl AsyncWrite for WebsocketTunnel {
         let sw = self.get_mut().inner.get_mut();
         ready!(Pin::new(&mut sw.inner)
             .poll_ready(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err)))?;
+            .map_err(Error::other))?;
 
-        match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec())) {
+        match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec().into())) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+            Err(e) => Poll::Ready(Err(Error::other(e))),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Pin::new(&mut self.get_mut().inner.get_mut().inner)
             .poll_flush(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Pin::new(&mut self.get_mut().inner.get_mut().inner)
             .poll_close(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 }
 
@@ -194,10 +192,7 @@ impl Transport for WebsocketTransport {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing websocket config"))?;
 
-        let conf = WebSocketConfig {
-            write_buffer_size: 0,
-            ..WebSocketConfig::default()
-        };
+        let conf = WebSocketConfig::default().write_buffer_size(0);
         let sub = match wsconfig.tls {
             true => SubTransport::Secure(TlsTransport::new(config)?),
             false => SubTransport::Insecure(TcpTransport::new(config)?),
@@ -227,7 +222,7 @@ impl Transport for WebsocketTransport {
     async fn handshake(&self, conn: Self::RawStream) -> anyhow::Result<Self::Stream> {
         let tsream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.handshake(conn).await?),
-            SubTransport::Secure(t) => TransportStream::Secure(t.handshake(conn).await?),
+            SubTransport::Secure(t) => TransportStream::Secure(Box::new(t.handshake(conn).await?)),
         };
         let wsstream = accept_async_with_config(tsream, Some(self.conf)).await?;
         let tun = WebsocketTunnel {
@@ -238,14 +233,14 @@ impl Transport for WebsocketTransport {
 
     async fn connect(&self, addr: &AddrMaybeCached) -> anyhow::Result<Self::Stream> {
         let u = format!("ws://{}", &addr.addr.as_str());
-        let url = Url::parse(&u).unwrap();
+        let url = Url::parse(&u).with_context(|| "Failed to build websocket URL")?;
         let tstream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.connect(addr).await?),
-            SubTransport::Secure(t) => TransportStream::Secure(t.connect(addr).await?),
+            SubTransport::Secure(t) => TransportStream::Secure(Box::new(t.connect(addr).await?)),
         };
-        let (wsstream, _) = client_async_with_config(url, tstream, Some(self.conf))
+        let (wsstream, _) = client_async_with_config(url.as_str(), tstream, Some(self.conf))
             .await
-            .expect("failed to connect");
+            .with_context(|| "Failed to connect websocket transport")?;
         let tun = WebsocketTunnel {
             inner: StreamReader::new(StreamWrapper { inner: wsstream }),
         };

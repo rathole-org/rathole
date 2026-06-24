@@ -355,8 +355,13 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+        let handle = ControlChannelHandle::new(
+            conn,
+            service_config,
+            server_config.heartbeat_interval,
+            control_channels.clone(),
+            session_key,
+        );
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -410,6 +415,8 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+        session_key: Nonce,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -505,12 +512,15 @@ where
             heartbeat_interval,
         };
 
-        // Run the control channel
+        // On exit, drop the handle so `shutdown_tx` drops and the data channel pool
+        // closes; otherwise its sockets leak. session_key is unique, so this never
+        // removes a reconnected session.
         tokio::spawn(
             async move {
                 if let Err(err) = ch.run().await {
                     error!("{:#}", err);
                 }
+                control_channels.write().await.remove2(&session_key);
             }
             .instrument(Span::current()),
         );
@@ -532,25 +542,47 @@ struct ControlChannel<T: Transport> {
 }
 
 impl<T: Transport> ControlChannel<T> {
-    async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
-        write_and_flush(&mut self.conn, data)
-            .await
-            .with_context(|| "Failed to write control cmds")?;
-        Ok(())
-    }
     // Run a control channel
     #[instrument(skip_all)]
-    async fn run(mut self) -> Result<()> {
+    async fn run(self) -> Result<()> {
         let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
         let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
+
+        // Split so we can read (to detect a dead client) and write concurrently.
+        let ControlChannel {
+            conn,
+            mut shutdown_rx,
+            mut data_ch_req_rx,
+            heartbeat_interval,
+        } = self;
+        let (mut rd, mut wr) = tokio::io::split(conn);
+        let mut probe = [0u8; 1];
 
         // Wait for data channel requests and the shutdown signal
         loop {
             tokio::select! {
-                val = self.data_ch_req_rx.recv() => {
+                // The client sends nothing after the handshake, so any completed
+                // read means it's gone. Heartbeat writes alone never notice a
+                // half-closed client, which leaks its sockets.
+                res = rd.read(&mut probe) => {
+                    match res {
+                        Ok(0) => {
+                            debug!("Control channel closed by the client");
+                            break;
+                        }
+                        Ok(_) => {
+                            // Unexpected data; ignore.
+                        }
+                        Err(e) => {
+                            error!("Control channel read error: {:#}", e);
+                            break;
+                        }
+                    }
+                },
+                val = data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
-                            if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
+                            if let Err(e) = write_and_flush(&mut wr, &create_ch_cmd).await {
                                 error!("{:#}", e);
                                 break;
                             }
@@ -560,14 +592,14 @@ impl<T: Transport> ControlChannel<T> {
                         }
                     }
                 },
-                _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
-                            if let Err(e) = self.write_and_flush(&heartbeat).await {
+                _ = time::sleep(Duration::from_secs(heartbeat_interval)), if heartbeat_interval != 0 => {
+                            if let Err(e) = write_and_flush(&mut wr, &heartbeat).await {
                                 error!("{:#}", e);
                                 break;
                             }
                 }
                 // Wait for the shutdown signal
-                _ = self.shutdown_rx.recv() => {
+                _ = shutdown_rx.recv() => {
                     break;
                 }
             }

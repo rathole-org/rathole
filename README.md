@@ -39,6 +39,8 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 A full-powered `rathole` can be obtained from the [release](https://github.com/rapiz1/rathole/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**. A [Docker image](https://hub.docker.com/r/rapiz1/rathole) is also available.
 
+For Debian-based systems, `rathole` is available in the [pkg.haus](https://pkg.haus) archive. Follow the [setup instructions](https://pkg.haus) to configure the repository, then install with `sudo apt install rathole`.
+
 The usage of `rathole` is very similar to frp. If you have experience with the latter, then the configuration is very easy for you. The only difference is that configuration of a service is split into the client side and the server side, and a token is mandatory.
 
 To use `rathole`, you need a server with a public IP, and a device behind the NAT, where some services that need to be exposed to the Internet.

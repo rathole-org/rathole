@@ -3,6 +3,7 @@ use common::{run_rathole_client, PING, PONG};
 use rand::Rng;
 use rand::RngCore;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::Path;
 use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -80,7 +81,7 @@ async fn tcp() -> Result<()> {
          // On other OS accept run with either
          all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
      ))]
-    test("tests/for_tcp/tls_transport.toml", Type::Tcp).await?;
+    test_tls("tests/for_tcp/tls_transport.toml", Type::Tcp).await?;
 
     #[cfg(feature = "noise")]
     test("tests/for_tcp/noise_transport.toml", Type::Tcp).await?;
@@ -90,7 +91,7 @@ async fn tcp() -> Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;
+    test_tls("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;
 
     Ok(())
 }
@@ -121,7 +122,7 @@ async fn udp() -> Result<()> {
          // On other OS accept run with either
          all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
      ))]
-    test("tests/for_udp/tls_transport.toml", Type::Udp).await?;
+    test_tls("tests/for_udp/tls_transport.toml", Type::Udp).await?;
 
     #[cfg(feature = "noise")]
     test("tests/for_udp/noise_transport.toml", Type::Udp).await?;
@@ -131,7 +132,7 @@ async fn udp() -> Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
+    test_tls("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
 
     Ok(())
 }
@@ -170,7 +171,7 @@ async fn socket_stream() -> Result<()> {
          // On other OS accept run with either
          all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
      ))]
-    test(
+    test_tls(
         "tests/for_socket_stream/tls_transport.toml",
         Type::SocketStream,
     )
@@ -192,7 +193,7 @@ async fn socket_stream() -> Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test(
+    test_tls(
         "tests/for_socket_stream/websocket_tls_transport.toml",
         Type::SocketStream,
     )
@@ -202,19 +203,22 @@ async fn socket_stream() -> Result<()> {
 }
 
 #[instrument]
-async fn test(config_path: &'static str, t: Type) -> Result<()> {
+async fn test(config_path: impl AsRef<Path> + std::fmt::Debug, t: Type) -> Result<()> {
     if cfg!(not(all(feature = "client", feature = "server"))) {
         // Skip the test if the client or the server is not enabled
         return Ok(());
     }
+
+    let config_path = config_path.as_ref().to_path_buf();
 
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
 
     // Start the client
     info!("start the client");
+    let client_config_path = config_path.clone();
     let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
+        run_rathole_client(client_config_path, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -224,8 +228,9 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
     // Start the server
     info!("start the server");
+    let server_config_path = config_path.clone();
     let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
+        run_rathole_server(server_config_path, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -245,8 +250,9 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
     info!("restart the client");
     let client_shutdown_rx = client_shutdown_tx.subscribe();
+    let client_config_path = config_path.clone();
     let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
+        run_rathole_client(client_config_path, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -266,8 +272,9 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
     info!("restart the server");
     let server_shutdown_rx = server_shutdown_tx.subscribe();
+    let server_config_path = config_path.clone();
     let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
+        run_rathole_server(server_config_path, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -302,6 +309,14 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     let _ = tokio::join!(server, client);
 
     Ok(())
+}
+
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+async fn test_tls(config_template: impl AsRef<Path>, t: Type) -> Result<()> {
+    let config = common::tls::TlsTestConfig::from_template(config_template)?;
+    let result = test(config.path(), t).await;
+    config.close()?;
+    result
 }
 
 async fn echo_hitter(addr: &'static str, t: Type) -> Result<()> {
@@ -444,8 +459,9 @@ async fn test_proxy_protocol(config_path: &'static str) -> Result<()> {
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
 
     info!("start the client");
+    let client_config_path = config_path.into();
     let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
+        run_rathole_client(client_config_path, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -453,8 +469,9 @@ async fn test_proxy_protocol(config_path: &'static str) -> Result<()> {
     time::sleep(Duration::from_secs(1)).await;
 
     info!("start the server");
+    let server_config_path = config_path.into();
     let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
+        run_rathole_server(server_config_path, server_shutdown_rx)
             .await
             .unwrap();
     });

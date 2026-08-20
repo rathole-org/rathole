@@ -133,3 +133,9 @@ vergen-gitcl = { version = "9.1.0", default-features = false, features = [
     "cargo"
 ] }
 anyhow = "1.0"
+
+[dev-dependencies]
+p12 = "0.6.3"
+rcgen = "0.14"
+tempfile = "3"
+time = "0.3"

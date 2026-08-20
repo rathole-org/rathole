@@ -33,7 +33,13 @@ Aruguments are:
 - `-in`: Server Certificate
 - `-certfile`: CA Certificate
 
-Creating self-signed certificate with one's own CA is a non-trival task. However, a script is provided under tls example folder for reference.
+Creating a self-signed certificate with one's own CA is a non-trivial task. The
+TLS example includes a script that generates the required files locally (they
+are intentionally not committed):
+
+```sh
+./examples/tls/create_self_signed_cert.sh
+```
 
 ### Rustls Support
 

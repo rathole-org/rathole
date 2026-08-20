@@ -1,6 +1,13 @@
 #!/bin/sh
 
-# create CA 
+set -eu
+
+# Always place generated artifacts beside this script so the example configs
+# work when this command is invoked from the repository root.
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$script_dir"
+
+# create CA
 openssl req -x509 \
             -sha256 -days 356 \
             -nodes \

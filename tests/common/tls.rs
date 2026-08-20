@@ -2,7 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use p12::PFX;
+use p12_keystore::{
+    Certificate, EncryptionAlgorithm, KeyStore, KeyStoreEntry, MacAlgorithm, PrivateKey,
+    PrivateKeyChain,
+};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose,
@@ -64,15 +67,27 @@ impl TlsTestConfig {
             .signed_by(&server_key, &ca_issuer)
             .context("failed to create test server certificate")?;
 
-        let identity = PFX::new(
-            server_cert.der().as_ref(),
-            server_key.serialized_der(),
-            Some(ca_cert.der().as_ref()),
-            PKCS12_PASSWORD,
+        let server_cert_der = server_cert.der().as_ref();
+        let ca_cert_der = ca_cert.der().as_ref();
+        let key_chain = PrivateKeyChain::new(
             "rathole integration test",
-        )
-        .ok_or_else(|| anyhow!("failed to create test PKCS#12 identity"))?
-        .to_der();
+            PrivateKey::from_der(server_key.serialized_der())?,
+            [
+                Certificate::from_der(server_cert_der)?,
+                Certificate::from_der(ca_cert_der)?,
+            ],
+        );
+        let mut key_store = KeyStore::new();
+        key_store.add_entry(
+            "rathole integration test",
+            KeyStoreEntry::PrivateKeyChain(key_chain),
+        );
+        let identity = key_store
+            .writer(PKCS12_PASSWORD)
+            .encryption_algorithm(EncryptionAlgorithm::PbeWithHmacSha256AndAes256)
+            .mac_algorithm(MacAlgorithm::HmacSha256)
+            .write()
+            .context("failed to create test PKCS#12 identity")?;
 
         let trusted_root_path = artifact_dir.join("rootCA.crt");
         let ca_key_path = artifact_dir.join("rootCA.key");

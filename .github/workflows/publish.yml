@@ -423,8 +423,11 @@ jobs:
           docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}" |
             jq -e '[.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
 
-          version_output="$(docker run --rm --platform linux/amd64 "${IMAGE}@${DIGEST}" ./rathole --version 2>&1)"
-          grep -F "Commit SHA:          Some(\"${GITHUB_SHA}\")" <<< "${version_output}"
+          for platform in linux/amd64 linux/arm64; do
+            version_output="$(docker run --rm --platform "${platform}" "${IMAGE}@${DIGEST}" --version 2>&1)"
+            grep -F "Commit SHA:          Some(\"${GITHUB_SHA}\")" <<< "${version_output}"
+            echo "Verified ${platform} runtime"
+          done
           echo "Verified ${IMAGE}@${DIGEST}"
 
   crate:

@@ -6,7 +6,7 @@ on:
     tags: ["v*"]
 
 concurrency:
-  group: publish-${{ github.ref }}
+  group: publish-${{ github.ref_type == 'tag' && 'release' || github.ref }}
   cancel-in-progress: ${{ github.ref == 'refs/heads/dev' }}
 
 permissions:
@@ -29,6 +29,9 @@ jobs:
       commit-timestamp: ${{ steps.release.outputs.commit-timestamp }}
       crate-checksum: ${{ steps.package.outputs.checksum }}
       git-describe: ${{ steps.release.outputs.git-describe }}
+      publish-latest-alias: ${{ steps.release.outputs.publish-latest-alias }}
+      publish-major-alias: ${{ steps.release.outputs.publish-major-alias }}
+      publish-minor-alias: ${{ steps.release.outputs.publish-minor-alias }}
       release-tag: ${{ steps.release.outputs.release-tag }}
       source-date-epoch: ${{ steps.release.outputs.source-date-epoch }}
       version: ${{ steps.release.outputs.version }}
@@ -51,6 +54,9 @@ jobs:
           set -euo pipefail
 
           package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "rathole") | .version')"
+          publish_latest_alias=false
+          publish_major_alias=false
+          publish_minor_alias=false
 
           if [[ "${REF_TYPE}" == "tag" ]]; then
             if [[ ! "${REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
@@ -85,6 +91,36 @@ jobs:
                 echo "::error::Stable tags must point to a commit on main"
                 exit 1
               fi
+
+              tag_refs="$(mktemp)"
+              git ls-remote --tags --refs origin 'v*' > "${tag_refs}"
+              mapfile -t stable_aliases < <(
+                python3 - "${version}" "${tag_refs}" <<'PY'
+          import re
+          import sys
+
+          current = tuple(int(part) for part in sys.argv[1].split("."))
+          versions = set()
+          with open(sys.argv[2], encoding="utf-8") as refs:
+              for line in refs:
+                  ref = line.rstrip().split("\t")[-1]
+                  match = re.fullmatch(r"refs/tags/v(\d+)\.(\d+)\.(\d+)", ref)
+                  if match:
+                      versions.add(tuple(int(part) for part in match.groups()))
+
+          if current not in versions:
+              raise SystemExit("release tag is no longer present on origin")
+
+          minor_versions = [candidate for candidate in versions if candidate[:2] == current[:2]]
+          major_versions = [candidate for candidate in versions if candidate[0] == current[0]]
+          print(str(current == max(versions)).lower())
+          print(str(current == max(major_versions)).lower())
+          print(str(current == max(minor_versions)).lower())
+          PY
+              )
+              publish_latest_alias="${stable_aliases[0]}"
+              publish_major_alias="${stable_aliases[1]}"
+              publish_minor_alias="${stable_aliases[2]}"
             fi
 
             release_tag="${REF_NAME}"
@@ -106,6 +142,9 @@ jobs:
             echo "channel=${channel}"
             echo "commit-timestamp=${commit_timestamp}"
             echo "git-describe=${git_describe}"
+            echo "publish-latest-alias=${publish_latest_alias}"
+            echo "publish-major-alias=${publish_major_alias}"
+            echo "publish-minor-alias=${publish_minor_alias}"
             echo "release-tag=${release_tag}"
             echo "source-date-epoch=${source_date_epoch}"
             echo "version=${version}"
@@ -311,13 +350,14 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
+          flavor: latest=false
           tags: |
             type=raw,value=dev,enable=${{ needs.prepare.outputs.channel == 'dev' }}
             type=raw,value=dev-${{ github.sha }},enable=${{ needs.prepare.outputs.channel == 'dev' }}
             type=semver,pattern={{version}},enable=${{ needs.prepare.outputs.channel != 'dev' }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.prepare.outputs.channel == 'stable' }}
-            type=semver,pattern={{major}},enable=${{ needs.prepare.outputs.channel == 'stable' && !startsWith(needs.prepare.outputs.version, '0.') }}
-            type=raw,value=latest,enable=${{ needs.prepare.outputs.channel == 'stable' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.prepare.outputs.publish-minor-alias == 'true' }}
+            type=semver,pattern={{major}},enable=${{ needs.prepare.outputs.publish-major-alias == 'true' && !startsWith(needs.prepare.outputs.version, '0.') }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.publish-latest-alias == 'true' }}
       - name: Build and push container
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0

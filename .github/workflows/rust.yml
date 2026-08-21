@@ -2,71 +2,146 @@ name: Rust
 
 on:
   pull_request:
-    branches: ["*"]
   push:
-    branches: ["main", "dev"]
+    branches: [main, dev]
+  workflow_dispatch:
 
 concurrency:
-  # Documentation suggests ${{ github.head_ref }}, but that's only available on pull_request/pull_request_target triggers, so using ${{ github.ref }}.
-  # On main, we want all builds to complete even if merging happens faster to make it easier to discover at which point something broke.
   group: ${{ github.ref == 'refs/heads/main' && format('ci-main-{0}', github.sha) || format('ci-{0}', github.ref) }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  lints:
-    name: Lints
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - name: Clippy
-        run: cargo clippy -- -D warnings
-      - name: Setup cargo-hack
-        run: cargo install cargo-hack
-      - name: Check all features
-        run: >
-          cargo hack check --feature-powerset --no-dev-deps --exclude-no-default-features
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          rustflags: ""
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy with default features
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Clippy with rustls features
+        run: >-
+          cargo clippy --locked --all-targets --no-default-features
+          --features server,client,rustls,noise,websocket-rustls,hot-reload,console
+          -- -D warnings
+
+  features:
+    name: Feature combinations (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.92.0", stable]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          rustflags: ""
+      - name: Install cargo-hack 0.6.45
+        run: cargo install cargo-hack --version 0.6.45 --locked
+      - name: Check supported feature combinations
+        run: >-
+          cargo hack check --feature-powerset --no-dev-deps
           --mutually-exclusive-features native-tls,rustls
           --mutually-exclusive-features websocket-native-tls,websocket-rustls
-          --at-least-one-of native-tls,rustls
           --at-least-one-of client,server
 
-
-
-  build:
-    name: Build for ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+  unit:
+    name: Unit (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.92.0", stable]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          rustflags: ""
+      - name: Unit tests with default features
+        run: cargo test --locked --lib --bins
+      - name: Unit tests with rustls
+        run: >-
+          cargo test --locked --lib --bins --no-default-features
+          --features server,client,rustls,noise,websocket-rustls,hot-reload
+      - name: Documentation tests
+        run: cargo test --locked --doc
+
+  integration:
+    name: Integration (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            exe: rathole
+          - name: linux-x86_64
+            os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            exe: rathole.exe
+          - name: windows-x86_64
+            os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: macos-latest
-            exe: rathole
+          - name: macos-x86_64
+            os: macos-15-intel
             target: x86_64-apple-darwin
-          - os: macos-latest
-            exe: rathole
+          - name: macos-arm64
+            os: macos-15
             target: aarch64-apple-darwin
-
+    env:
+      RUST_LOG: "off"
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
+          toolchain: stable
+          target: ${{ matrix.target }}
           rustflags: ""
       - name: Build
-        run: cargo build
-      - name: Run tests with native-tls
-        run: cargo test --verbose
-      - name: Run tests with rustls
-        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rathole-${{ matrix.target }}
-          path: target/debug/${{ matrix.exe }}
+        run: cargo build --locked --target ${{ matrix.target }}
+      - name: Integration tests with native-tls
+        run: cargo test --locked --target ${{ matrix.target }} --test integration_test
+      - name: Integration tests with rustls
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} --test integration_test
+          --no-default-features
+          --features server,client,rustls,noise,websocket-rustls,hot-reload
+
+  required:
+    name: Required checks
+    if: ${{ always() }}
+    needs: [lint, features, unit, integration]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify required jobs
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          FEATURES_RESULT: ${{ needs.features.result }}
+          UNIT_RESULT: ${{ needs.unit.result }}
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+        run: |
+          if [[ "${LINT_RESULT}" != "success" ||
+                "${FEATURES_RESULT}" != "success" ||
+                "${UNIT_RESULT}" != "success" ||
+                "${INTEGRATION_RESULT}" != "success" ]]; then
+            echo "::error::Required job failed: lint=${LINT_RESULT}, features=${FEATURES_RESULT}, unit=${UNIT_RESULT}, integration=${INTEGRATION_RESULT}"
+            exit 1
+          fi

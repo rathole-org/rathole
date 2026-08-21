@@ -6,3 +6,6 @@ perf.data.old
 /examples/tls/*.crt
 /examples/tls/*.key
 /examples/tls/*.pfx
+/examples/tls/*.csr
+/examples/tls/cert.conf
+/examples/tls/csr.conf

@@ -7,9 +7,16 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$script_dir"
 
+cleanup() {
+    rm -f server.csr csr.conf cert.conf
+}
+
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+
 # create CA
 openssl req -x509 \
-            -sha256 -days 356 \
+            -sha256 -days 365 \
             -nodes \
             -newkey rsa:2048 \
             -subj "/CN=MyOwnCA/C=US/L=San Fransisco" \
@@ -64,7 +71,4 @@ openssl x509 -req \
 
 # create a PKCS#12 identity compatible with both native-tls and rustls
 openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile rootCA.crt \
-    -passout pass:1234 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
-
-# clean up
-rm server.csr csr.conf cert.conf
+    -passout pass:1234 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha256

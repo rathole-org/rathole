@@ -137,5 +137,6 @@ anyhow = "1.0"
 [dev-dependencies]
 p12-keystore = "0.3.1"
 rcgen = "0.14"
+rsa = { version = "0.9.10", features = ["pem"] }
 tempfile = "3"
 time = "0.3"

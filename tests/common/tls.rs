@@ -201,9 +201,9 @@ fn set_config_value(config: &mut Value, path: &[&str], value: String) -> Result<
 mod tests {
     use super::*;
 
-    #[test]
-    fn generates_and_cleans_up_tls_artifacts() -> Result<()> {
-        let config = TlsTestConfig::from_template("tests/for_tcp/tls_transport.toml")?;
+    #[tokio::test]
+    async fn generates_and_cleans_up_tls_artifacts() -> Result<()> {
+        let config = crate::setup_tls_test_config("tests/for_tcp/tls_transport.toml").await?;
         let artifact_dir = config
             .path()
             .parent()

@@ -1,5 +1,12 @@
 # Integration tests
 
+## Scenario deadlines
+
+Every integration scenario has a 60-second deadline. TLS artifact generation
+runs on a dedicated thread under a separate 60-second setup deadline.
+Timeout errors identify the config and phase, then managed client and server
+tasks are shut down before the test returns.
+
 ## TLS artifacts
 
 TLS integration tests generate an isolated CA, server certificate, private

@@ -36,9 +36,12 @@ impl Debug for TlsTransport {
 
 fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
     if let Some(pkcs12_path) = config.pkcs12.as_ref() {
+        let pass = config
+            .pkcs12_password
+            .as_ref()
+            .context("Missing `tls.pkcs12_password`")?;
         let buf = fs::read(pkcs12_path)?;
         let pfx = PFX::parse(buf.as_slice())?;
-        let pass = config.pkcs12_password.as_ref().unwrap();
 
         let certs = pfx.cert_bags(pass)?;
         let keys = pfx.key_bags(pass)?;
@@ -124,12 +127,8 @@ impl Transport for TlsTransport {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing tls config"))?;
 
-        let connector = load_client_config(config)
-            .unwrap()
-            .map(|c| Arc::new(c).into());
-        let tls_acceptor = load_server_config(config)
-            .unwrap()
-            .map(|c| Arc::new(c).into());
+        let connector = load_client_config(config)?.map(|c| Arc::new(c).into());
+        let tls_acceptor = load_server_config(config)?.map(|c| Arc::new(c).into());
 
         Ok(TlsTransport {
             tcp,
@@ -183,4 +182,66 @@ impl Transport for TlsTransport {
 
 pub(crate) fn get_tcpstream(s: &TlsStream<TcpStream>) -> &TcpStream {
     &s.get_ref().0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{MaskedString, TransportType};
+
+    fn server_transport(identity_path: &Path, password: Option<&str>) -> TransportConfig {
+        TransportConfig {
+            transport_type: TransportType::Tls,
+            tls: Some(TlsConfig {
+                hostname: None,
+                trusted_root: None,
+                pkcs12: Some(identity_path.to_string_lossy().into_owned()),
+                pkcs12_password: password.map(MaskedString::from),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn client_transport(trusted_root_path: &Path) -> TransportConfig {
+        TransportConfig {
+            transport_type: TransportType::Tls,
+            tls: Some(TlsConfig {
+                hostname: None,
+                trusted_root: Some(trusted_root_path.to_string_lossy().into_owned()),
+                pkcs12: None,
+                pkcs12_password: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn malformed_trusted_root_returns_error() -> Result<()> {
+        let trusted_root = tempfile::NamedTempFile::new()?;
+        fs::write(trusted_root.path(), b"not a PEM certificate")?;
+
+        let result = TlsTransport::new(&client_transport(trusted_root.path()));
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_identity_returns_error() -> Result<()> {
+        let identity = tempfile::NamedTempFile::new()?;
+        fs::write(identity.path(), b"not a PKCS#12 identity")?;
+
+        let result = TlsTransport::new(&server_transport(identity.path(), Some("password")));
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_identity_password_returns_error() -> Result<()> {
+        let identity = tempfile::NamedTempFile::new()?;
+        let result = TlsTransport::new(&server_transport(identity.path(), None));
+
+        let error = result.expect_err("missing PKCS#12 password should fail");
+        assert!(error.to_string().contains("tls.pkcs12_password"));
+        Ok(())
+    }
 }

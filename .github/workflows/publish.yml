@@ -644,7 +644,8 @@ jobs:
           stale_assets=false
           mapfile -t remote_asset_names < <(jq -r '.assets[].name' <<< "${release_data}")
           for asset in "${remote_asset_names[@]}"; do
-            if [[ ! -f "dist/${asset}" ]]; then
+            if [[ "${asset}" == "SHA256SUMS" || "${asset}" == "rathole-${VERSION}-"*.tar.gz ]] &&
+               [[ ! -f "dist/${asset}" ]]; then
               stale_assets=true
               break
             fi
@@ -658,18 +659,20 @@ jobs:
           if [[ "${#missing_assets[@]}" -gt 0 ]]; then
             gh release upload "${RELEASE_TAG}" "${missing_assets[@]}"
           fi
-      - name: Remove stale release assets
+      - name: Remove stale managed release assets
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
 
           remote_assets="$(gh release view "${RELEASE_TAG}" --json assets)"
           mapfile -t asset_names < <(jq -r '.assets[].name' <<< "${remote_assets}")
           for asset in "${asset_names[@]}"; do
-            if [[ ! -f "dist/${asset}" ]]; then
+            if [[ "${asset}" == "SHA256SUMS" || "${asset}" == "rathole-${VERSION}-"*.tar.gz ]] &&
+               [[ ! -f "dist/${asset}" ]]; then
               gh release delete-asset "${RELEASE_TAG}" "${asset}" --yes
             fi
           done

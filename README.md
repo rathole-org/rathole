@@ -2,11 +2,11 @@
 
 ![rathole-logo](./docs/img/rathole-logo.png)
 
-[![GitHub stars](https://img.shields.io/github/stars/rapiz1/rathole)](https://github.com/rapiz1/rathole/stargazers)
-[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/rapiz1/rathole)](https://github.com/rapiz1/rathole/releases)
-![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/rapiz1/rathole/rust.yml?branch=main)
-[![GitHub all releases](https://img.shields.io/github/downloads/rapiz1/rathole/total)](https://github.com/rapiz1/rathole/releases)
-[![Docker Pulls](https://img.shields.io/docker/pulls/rapiz1/rathole)](https://hub.docker.com/r/rapiz1/rathole)
+[![GitHub stars](https://img.shields.io/github/stars/rathole-org/rathole)](https://github.com/rathole-org/rathole/stargazers)
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/rathole-org/rathole)](https://github.com/rathole-org/rathole/releases)
+![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/rathole-org/rathole/rust.yml?branch=main)
+[![GitHub all releases](https://img.shields.io/github/downloads/rathole-org/rathole/total)](https://github.com/rathole-org/rathole/releases)
+[![Container image](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/orgs/rathole-org/packages/container/package/rathole)
 [![Join the chat at https://gitter.im/rapiz1/rathole](https://badges.gitter.im/rapiz1/rathole.svg)](https://gitter.im/rapiz1/rathole?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 [English](README.md) | [简体中文](README-zh.md)
@@ -37,7 +37,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 ## Quickstart
 
-A full-powered `rathole` can be obtained from the [release](https://github.com/rapiz1/rathole/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**. A [Docker image](https://hub.docker.com/r/rapiz1/rathole) is also available.
+A full-powered `rathole` can be obtained from the [release](https://github.com/rathole-org/rathole/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**. A [container image](https://github.com/orgs/rathole-org/packages/container/package/rathole) is also available from GHCR.
 
 The usage of `rathole` is very similar to frp. If you have experience with the latter, then the configuration is very easy for you. The only difference is that configuration of a service is split into the client side and the server side, and a token is mandatory.
 

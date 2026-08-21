@@ -1,0 +1,507 @@
+name: Publish
+
+on:
+  push:
+    branches: [dev]
+    tags: ["v*"]
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/dev' }}
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CROSS_VERSION: "0.2.5"
+  IMAGE: ghcr.io/${{ github.repository }}
+  RUST_VERSION: "1.92.0"
+
+jobs:
+  prepare:
+    name: Validate release input
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      channel: ${{ steps.release.outputs.channel }}
+      commit-timestamp: ${{ steps.release.outputs.commit-timestamp }}
+      crate-checksum: ${{ steps.package.outputs.checksum }}
+      git-describe: ${{ steps.release.outputs.git-describe }}
+      release-tag: ${{ steps.release.outputs.release-tag }}
+      source-date-epoch: ${{ steps.release.outputs.source-date-epoch }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          rustflags: ""
+      - name: Resolve publishing channel
+        id: release
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "rathole") | .version')"
+
+          if [[ "${REF_TYPE}" == "tag" ]]; then
+            if [[ ! "${REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+              echo "::error::Release tag must be a semantic version beginning with v"
+              exit 1
+            fi
+
+            version="${REF_NAME#v}"
+            if [[ "${version}" != "${package_version}" ]]; then
+              echo "::error::Tag ${REF_NAME} does not match Cargo package version ${package_version}"
+              exit 1
+            fi
+
+            git fetch --no-tags origin main:refs/remotes/origin/main
+            if [[ "${version}" == *-* ]]; then
+              channel="prerelease"
+              on_release_branch=false
+              if git ls-remote --exit-code --heads origin dev >/dev/null 2>&1; then
+                git fetch --no-tags origin dev:refs/remotes/origin/dev
+                if git merge-base --is-ancestor "${GITHUB_SHA}" origin/dev; then
+                  on_release_branch=true
+                fi
+              fi
+              if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main &&
+                 [[ "${on_release_branch}" != true ]]; then
+                echo "::error::Prerelease tags must point to a commit on dev or main"
+                exit 1
+              fi
+            else
+              channel="stable"
+              if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+                echo "::error::Stable tags must point to a commit on main"
+                exit 1
+              fi
+            fi
+
+            release_tag="${REF_NAME}"
+          else
+            if [[ "${REF_NAME}" != "dev" ]]; then
+              echo "::error::Branch publishing is restricted to dev"
+              exit 1
+            fi
+            channel="dev"
+            release_tag="dev-latest"
+            version="dev"
+          fi
+
+          commit_timestamp="$(git show -s --format=%cI "${GITHUB_SHA}")"
+          git_describe="$(git describe --always --tags "${GITHUB_SHA}")"
+          source_date_epoch="$(git show -s --format=%ct "${GITHUB_SHA}")"
+
+          {
+            echo "channel=${channel}"
+            echo "commit-timestamp=${commit_timestamp}"
+            echo "git-describe=${git_describe}"
+            echo "release-tag=${release_tag}"
+            echo "source-date-epoch=${source_date_epoch}"
+            echo "version=${version}"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Verify crate package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo package --locked
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "rathole") | .version')"
+          checksum="$(sha256sum "target/package/rathole-${package_version}.crate" | awk '{print $1}')"
+          echo "checksum=${checksum}" >> "${GITHUB_OUTPUT}"
+      - name: Guard previously published crate versions
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          PACKAGE_CHECKSUM: ${{ steps.package.outputs.checksum }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          response="$(mktemp)"
+          status="$(curl --silent --show-error --retry 3 --retry-delay 2 --output "${response}" --write-out '%{http_code}' \
+            --user-agent 'rathole-release-workflow (https://github.com/rathole-org/rathole)' \
+            "https://crates.io/api/v1/crates/rathole/${VERSION}")"
+          case "${status}" in
+            200)
+              published_checksum="$(jq -er '.version.checksum' "${response}")"
+              if [[ "${PACKAGE_CHECKSUM}" != "${published_checksum}" ]]; then
+                echo "::error::Crate rathole ${VERSION} already exists with different source"
+                exit 1
+              fi
+              echo "Crate rathole ${VERSION} already contains this source"
+              ;;
+            404)
+              echo "Crate rathole ${VERSION} is available for publishing"
+              ;;
+            *)
+              echo "::error::crates.io returned HTTP ${status}"
+              exit 1
+              ;;
+          esac
+
+  binaries:
+    name: Binary (${{ matrix.name }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Rust 1.92 does not ship rust-std for the legacy MIPS targets.
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: rathole
+            builder: cargo
+            feature-set: default
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: rathole.exe
+            builder: cargo
+            feature-set: default
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: rathole
+            builder: cargo
+            feature-set: default
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            binary: rathole
+            builder: cargo
+            feature-set: default
+          - name: linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: rathole
+            builder: cross
+            feature-set: default-musl
+          - name: linux-arm64-musl
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            binary: rathole
+            builder: cross
+            feature-set: embedded
+          - name: linux-arm-musleabi
+            os: ubuntu-latest
+            target: arm-unknown-linux-musleabi
+            binary: rathole
+            builder: cross
+            feature-set: embedded
+          - name: linux-arm-musleabihf
+            os: ubuntu-latest
+            target: arm-unknown-linux-musleabihf
+            binary: rathole
+            builder: cross
+            feature-set: embedded
+          - name: linux-armv7-musleabihf
+            os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            binary: rathole
+            builder: cross
+            feature-set: embedded
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          target: ${{ matrix.target }}
+          rustflags: ""
+      - name: Install cross ${{ env.CROSS_VERSION }}
+        if: matrix.builder == 'cross'
+        run: cargo install cross --version "=${CROSS_VERSION}" --locked
+      - name: Build binary
+        shell: bash
+        env:
+          BUILDER: ${{ matrix.builder }}
+          FEATURE_SET: ${{ matrix.feature-set }}
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source-date-epoch }}
+          TARGET: ${{ matrix.target }}
+          VERGEN_GIT_BRANCH: ${{ github.ref_name }}
+          VERGEN_GIT_COMMIT_TIMESTAMP: ${{ needs.prepare.outputs.commit-timestamp }}
+          VERGEN_GIT_DESCRIBE: ${{ needs.prepare.outputs.git-describe }}
+          VERGEN_GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          build_args=(build --locked --release --target "${TARGET}" --bin rathole)
+          case "${FEATURE_SET}" in
+            default)
+              ;;
+            default-musl)
+              build_args+=(--features openssl)
+              ;;
+            embedded)
+              build_args+=(--no-default-features --features embedded)
+              ;;
+            *)
+              echo "::error::Unknown feature set ${FEATURE_SET}"
+              exit 1
+              ;;
+          esac
+
+          if [[ "${BUILDER}" == "cross" ]]; then
+            cross "${build_args[@]}"
+          else
+            cargo "${build_args[@]}"
+          fi
+      - name: Package binary
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          archive="rathole-${VERSION}-${TARGET}"
+          mkdir -p "dist/${archive}"
+          cp "target/${TARGET}/release/${BINARY}" "dist/${archive}/"
+          cp LICENSE README.md "dist/${archive}/"
+          tar -czf "dist/${archive}.tar.gz" -C dist "${archive}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  container:
+    name: Container (linux-amd64 + linux-arm64)
+    needs: [prepare, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate container metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=dev,enable=${{ needs.prepare.outputs.channel == 'dev' }}
+            type=raw,value=dev-${{ github.sha }},enable=${{ needs.prepare.outputs.channel == 'dev' }}
+            type=semver,pattern={{version}},enable=${{ needs.prepare.outputs.channel != 'dev' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.prepare.outputs.channel == 'stable' }}
+            type=semver,pattern={{major}},enable=${{ needs.prepare.outputs.channel == 'stable' && !startsWith(needs.prepare.outputs.version, '0.') }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.channel == 'stable' }}
+      - name: Build and push container
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ needs.prepare.outputs.source-date-epoch }}
+            VERGEN_GIT_BRANCH=${{ github.ref_name }}
+            VERGEN_GIT_COMMIT_TIMESTAMP=${{ needs.prepare.outputs.commit-timestamp }}
+            VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.git-describe }}
+            VERGEN_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=publish
+          cache-to: type=gha,mode=max,scope=publish
+          provenance: mode=max
+          sbom: true
+      - name: Verify multi-platform manifest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}" |
+            jq -e '[.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
+
+          version_output="$(docker run --rm --platform linux/amd64 "${IMAGE}@${DIGEST}" ./rathole --version 2>&1)"
+          grep -F "Commit SHA:          Some(\"${GITHUB_SHA}\")" <<< "${version_output}"
+          echo "Verified ${IMAGE}@${DIGEST}"
+
+  crate:
+    name: Publish crate
+    needs: [prepare, binaries, container]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Skip crate publishing for dev
+        if: needs.prepare.outputs.channel == 'dev'
+        run: echo "Crates are published only for version tags"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.prepare.outputs.channel != 'dev'
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        if: needs.prepare.outputs.channel != 'dev'
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          rustflags: ""
+      - name: Publish crate version
+        if: needs.prepare.outputs.channel != 'dev'
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
+          PACKAGE_CHECKSUM: ${{ needs.prepare.outputs.crate-checksum }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          response="$(mktemp)"
+          status="$(curl --silent --show-error --retry 3 --retry-delay 2 --output "${response}" --write-out '%{http_code}' \
+            --user-agent 'rathole-release-workflow (https://github.com/rathole-org/rathole)' \
+            "https://crates.io/api/v1/crates/rathole/${VERSION}")"
+          case "${status}" in
+            200)
+              published_checksum="$(jq -er '.version.checksum' "${response}")"
+              if [[ "${PACKAGE_CHECKSUM}" != "${published_checksum}" ]]; then
+                echo "::error::Crate rathole ${VERSION} was published from different source during this run"
+                exit 1
+              fi
+              echo "Crate rathole ${VERSION} already contains this source"
+              ;;
+            404)
+              cargo publish --locked
+              ;;
+            *)
+              echo "::error::crates.io returned HTTP ${status}"
+              exit 1
+              ;;
+          esac
+
+  release:
+    name: Publish release assets
+    needs: [prepare, binaries, container, crate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Generate and verify checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd dist
+          mapfile -t archives < <(find . -maxdepth 1 -type f -name 'rathole-*.tar.gz' -printf '%f\n' | sort)
+          if [[ "${#archives[@]}" -ne 9 ]]; then
+            echo "::error::Expected 9 archives, found ${#archives[@]}"
+            printf '%s\n' "${archives[@]}"
+            exit 1
+          fi
+          sha256sum "${archives[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets-${{ github.run_id }}
+          path: dist
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+      - name: Update rolling dev release
+        if: needs.prepare.outputs.channel == 'dev'
+        shell: bash
+        env:
+          DIGEST: ${{ needs.container.outputs.digest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
+        run: |
+          set -euo pipefail
+
+          git tag --force "${RELEASE_TAG}" "${GITHUB_SHA}"
+          git push --force origin "refs/tags/${RELEASE_TAG}"
+
+          {
+            printf "Automated build from \`dev\`.\n\n"
+            printf -- "- Commit: \`%s\`\n" "${GITHUB_SHA}"
+            printf -- "- Rust: \`%s\`\n" "${RUST_VERSION}"
+            printf -- "- Container: \`%s:dev\`\n" "${IMAGE}"
+            printf -- "- Immutable container: \`%s@%s\`\n" "${IMAGE}" "${DIGEST}"
+          } > RELEASE_NOTES.md
+
+          title="Dev build (${GITHUB_SHA::7})"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" --verify-tag --prerelease --target "${GITHUB_SHA}" --title "${title}" --notes-file RELEASE_NOTES.md
+          else
+            gh release create "${RELEASE_TAG}" --verify-tag --prerelease --target "${GITHUB_SHA}" --title "${title}" --notes-file RELEASE_NOTES.md
+          fi
+          gh release upload "${RELEASE_TAG}" dist/* --clobber
+      - name: Publish tagged release
+        if: needs.prepare.outputs.channel != 'dev'
+        shell: bash
+        env:
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          {
+            printf "Built with Rust \`%s\`.\n\n" "${RUST_VERSION}"
+            printf "Container: \`%s:%s\`\n" "${IMAGE}" "${VERSION}"
+          } > RELEASE_NOTES.md
+
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            if [[ "${CHANNEL}" == "prerelease" ]]; then
+              gh release create "${RELEASE_TAG}" --verify-tag --prerelease --generate-notes --title "${RELEASE_TAG}" --notes-file RELEASE_NOTES.md
+            else
+              gh release create "${RELEASE_TAG}" --verify-tag --latest --generate-notes --title "${RELEASE_TAG}" --notes-file RELEASE_NOTES.md
+            fi
+          fi
+          gh release upload "${RELEASE_TAG}" dist/* --clobber
+      - name: Remove stale release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
+        run: |
+          set -euo pipefail
+
+          remote_assets="$(gh release view "${RELEASE_TAG}" --json assets)"
+          mapfile -t asset_names < <(jq -r '.assets[].name' <<< "${remote_assets}")
+          for asset in "${asset_names[@]}"; do
+            if [[ ! -f "dist/${asset}" ]]; then
+              gh release delete-asset "${RELEASE_TAG}" "${asset}" --yes
+            fi
+          done

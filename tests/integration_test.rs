@@ -7,12 +7,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::AsyncFnOnce;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-#[cfg(any(feature = "native-tls", feature = "rustls"))]
-use tokio::sync::oneshot;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpStream, UdpSocket},
-    sync::broadcast,
+    sync::{broadcast, oneshot},
     task::{JoinHandle, JoinSet},
     time,
 };
@@ -477,8 +475,17 @@ async fn stop_task(
         Err(_) => {
             let task = task.take().expect("running task should exist");
             task.abort();
-            let _ = task.await;
             Err(anyhow!("{name} did not stop within {shutdown_timeout:?}"))
+        }
+    }
+}
+
+struct NotifyOnDrop(Option<oneshot::Sender<()>>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
         }
     }
 }
@@ -486,10 +493,19 @@ async fn stop_task(
 #[tokio::test]
 async fn stop_task_aborts_an_unresponsive_task() {
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+    let (started_tx, started_rx) = oneshot::channel();
+    let (dropped_tx, dropped_rx) = oneshot::channel();
     let mut task = Some(tokio::spawn(async move {
+        let _notify_on_drop = NotifyOnDrop(Some(dropped_tx));
+        let _ = started_tx.send(());
         let _ = shutdown_rx.recv().await;
         std::future::pending::<Result<()>>().await
     }));
+
+    time::timeout(Duration::from_secs(1), started_rx)
+        .await
+        .expect("test task should start promptly")
+        .expect("test task should report startup");
 
     let result = stop_task(
         "test task",
@@ -501,6 +517,10 @@ async fn stop_task_aborts_an_unresponsive_task() {
 
     assert!(result.is_err());
     assert!(task.is_none());
+    time::timeout(Duration::from_secs(1), dropped_rx)
+        .await
+        .expect("aborted task should be dropped promptly")
+        .expect("drop notification sender should survive until task cleanup");
 }
 
 #[tokio::test]
@@ -592,19 +612,25 @@ async fn test_tls(config_template: impl AsRef<Path>, t: Type) -> Result<()> {
         return Ok(());
     }
 
+    let config = setup_tls_test_config(config_template).await?;
+    let scenario_result = test(config.path(), t).await;
+    let cleanup_result = config.close();
+    finish_with_cleanup(scenario_result, cleanup_result, "TLS artifact cleanup")
+}
+
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+async fn setup_tls_test_config(
+    config_template: impl AsRef<Path>,
+) -> Result<common::tls::TlsTestConfig> {
     let template_path = config_template.as_ref().to_path_buf();
     let generation_path = template_path.clone();
-    let config = run_with_timeout(
+    run_with_timeout(
         &template_path,
         "TLS artifact setup",
         TLS_SETUP_TIMEOUT,
         generate_tls_test_config(generation_path),
     )
-    .await?;
-
-    let scenario_result = test(config.path(), t).await;
-    let cleanup_result = config.close();
-    finish_with_cleanup(scenario_result, cleanup_result, "TLS artifact cleanup")
+    .await
 }
 
 #[cfg(any(feature = "native-tls", feature = "rustls"))]

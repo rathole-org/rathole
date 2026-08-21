@@ -556,8 +556,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          git tag --force "${RELEASE_TAG}" "${GITHUB_SHA}"
-          git push --force origin "refs/tags/${RELEASE_TAG}"
+          release_exists=false
+          release_status="$(curl --silent --show-error --retry 3 --retry-delay 2 \
+            --output /dev/null --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          case "${release_status}" in
+            200)
+              release_exists=true
+              gh release edit "${RELEASE_TAG}" --draft
+              ;;
+            404)
+              ;;
+            *)
+              echo "::error::GitHub returned HTTP ${release_status} while checking ${RELEASE_TAG}"
+              exit 1
+              ;;
+          esac
 
           {
             printf "Automated build from \`dev\`.\n\n"
@@ -568,13 +585,15 @@ jobs:
           } > RELEASE_NOTES.md
 
           title="Dev build (${GITHUB_SHA::7})"
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release edit "${RELEASE_TAG}" --verify-tag --prerelease --target "${GITHUB_SHA}" --title "${title}" --notes-file RELEASE_NOTES.md
-          else
-            gh release create "${RELEASE_TAG}" --verify-tag --prerelease --target "${GITHUB_SHA}" --title "${title}" --notes-file RELEASE_NOTES.md
+          if [[ "${release_exists}" != "true" ]]; then
+            gh release create "${RELEASE_TAG}" --draft --prerelease --target "${GITHUB_SHA}" --title "${title}" --notes-file RELEASE_NOTES.md
           fi
+
+          git tag --force "${RELEASE_TAG}" "${GITHUB_SHA}"
+          git push --force origin "refs/tags/${RELEASE_TAG}"
+          gh release edit "${RELEASE_TAG}" --draft --verify-tag --prerelease --target "${GITHUB_SHA}" --title "${title}" --notes-file RELEASE_NOTES.md
           gh release upload "${RELEASE_TAG}" dist/* --clobber
-      - name: Publish tagged release
+      - name: Stage tagged release
         if: needs.prepare.outputs.channel != 'dev'
         shell: bash
         env:
@@ -590,20 +609,22 @@ jobs:
             printf "Container: \`%s:%s\`\n" "${IMAGE}" "${VERSION}"
           } > RELEASE_NOTES.md
 
-          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+          release_exists=true
+          if ! release_data="$(gh release view "${RELEASE_TAG}" --json assets,isDraft 2>/dev/null)"; then
+            release_exists=false
             if [[ "${CHANNEL}" == "prerelease" ]]; then
-              gh release create "${RELEASE_TAG}" --verify-tag --prerelease --generate-notes --title "${RELEASE_TAG}" --notes-file RELEASE_NOTES.md
+              gh release create "${RELEASE_TAG}" --draft --verify-tag --prerelease --generate-notes --title "${RELEASE_TAG}" --notes-file RELEASE_NOTES.md
             else
-              gh release create "${RELEASE_TAG}" --verify-tag --latest --generate-notes --title "${RELEASE_TAG}" --notes-file RELEASE_NOTES.md
+              gh release create "${RELEASE_TAG}" --draft --verify-tag --latest=false --generate-notes --title "${RELEASE_TAG}" --notes-file RELEASE_NOTES.md
             fi
+            release_data='{"assets":[],"isDraft":true}'
           fi
 
-          remote_assets="$(gh release view "${RELEASE_TAG}" --json assets)"
           compare_dir="$(mktemp -d)"
           mapfile -t local_assets < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
           missing_assets=()
           for asset in "${local_assets[@]}"; do
-            if jq -e --arg asset "${asset}" 'any(.assets[]; .name == $asset)' <<< "${remote_assets}" >/dev/null; then
+            if jq -e --arg asset "${asset}" 'any(.assets[]; .name == $asset)' <<< "${release_data}" >/dev/null; then
               gh release download "${RELEASE_TAG}" --pattern "${asset}" --dir "${compare_dir}"
               if ! cmp -s "dist/${asset}" "${compare_dir}/${asset}"; then
                 echo "::error::Release asset ${asset} already exists with different contents"
@@ -613,6 +634,21 @@ jobs:
               missing_assets+=("dist/${asset}")
             fi
           done
+
+          stale_assets=false
+          mapfile -t remote_asset_names < <(jq -r '.assets[].name' <<< "${release_data}")
+          for asset in "${remote_asset_names[@]}"; do
+            if [[ ! -f "dist/${asset}" ]]; then
+              stale_assets=true
+              break
+            fi
+          done
+
+          if [[ "${release_exists}" == "true" ]] &&
+             [[ "$(jq -r '.isDraft' <<< "${release_data}")" != "true" ]] &&
+             { [[ "${#missing_assets[@]}" -gt 0 ]] || [[ "${stale_assets}" == "true" ]]; }; then
+            gh release edit "${RELEASE_TAG}" --draft
+          fi
           if [[ "${#missing_assets[@]}" -gt 0 ]]; then
             gh release upload "${RELEASE_TAG}" "${missing_assets[@]}"
           fi
@@ -631,3 +667,44 @@ jobs:
               gh release delete-asset "${RELEASE_TAG}" "${asset}" --yes
             fi
           done
+      - name: Verify staged release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
+        run: |
+          set -euo pipefail
+
+          remote_assets="$(gh release view "${RELEASE_TAG}" --json assets)"
+          compare_dir="$(mktemp -d)"
+          mapfile -t local_assets < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+          for asset in "${local_assets[@]}"; do
+            if ! jq -e --arg asset "${asset}" 'any(.assets[]; .name == $asset)' <<< "${remote_assets}" >/dev/null; then
+              echo "::error::Release asset ${asset} is missing"
+              exit 1
+            fi
+            gh release download "${RELEASE_TAG}" --pattern "${asset}" --dir "${compare_dir}"
+            if ! cmp -s "dist/${asset}" "${compare_dir}/${asset}"; then
+              echo "::error::Release asset ${asset} does not match the staged artifact"
+              exit 1
+            fi
+          done
+      - name: Publish staged release
+        shell: bash
+        env:
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLISH_LATEST: ${{ needs.prepare.outputs.publish-latest-alias }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${CHANNEL}" == "stable" ]]; then
+            if [[ "${PUBLISH_LATEST}" == "true" ]]; then
+              gh release edit "${RELEASE_TAG}" --draft=false --prerelease=false --latest
+            else
+              gh release edit "${RELEASE_TAG}" --draft=false --prerelease=false --latest=false
+            fi
+          else
+            gh release edit "${RELEASE_TAG}" --draft=false --prerelease
+          fi

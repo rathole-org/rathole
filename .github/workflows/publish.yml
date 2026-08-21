@@ -34,6 +34,7 @@ jobs:
       publish-minor-alias: ${{ steps.release.outputs.publish-minor-alias }}
       release-tag: ${{ steps.release.outputs.release-tag }}
       source-date-epoch: ${{ steps.release.outputs.source-date-epoch }}
+      source-branch: ${{ steps.release.outputs.source-branch }}
       version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,8 +87,14 @@ jobs:
                 echo "::error::Prerelease tags must point to a commit on dev or main"
                 exit 1
               fi
+              if [[ "${on_release_branch}" == true ]]; then
+                source_branch="dev"
+              else
+                source_branch="main"
+              fi
             else
               channel="stable"
+              source_branch="main"
               if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
                 echo "::error::Stable tags must point to a commit on main"
                 exit 1
@@ -132,6 +139,7 @@ jobs:
             fi
             channel="dev"
             release_tag="dev-latest"
+            source_branch="dev"
             version="dev"
           fi
 
@@ -148,6 +156,7 @@ jobs:
             echo "publish-minor-alias=${publish_minor_alias}"
             echo "release-tag=${release_tag}"
             echo "source-date-epoch=${source_date_epoch}"
+            echo "source-branch=${source_branch}"
             echo "version=${version}"
           } >> "${GITHUB_OUTPUT}"
       - name: Verify crate package
@@ -284,7 +293,7 @@ jobs:
           FEATURE_SET: ${{ matrix.feature-set }}
           SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source-date-epoch }}
           TARGET: ${{ matrix.target }}
-          VERGEN_GIT_BRANCH: ${{ github.ref_name }}
+          VERGEN_GIT_BRANCH: ${{ needs.prepare.outputs.source-branch }}
           VERGEN_GIT_COMMIT_TIMESTAMP: ${{ needs.prepare.outputs.commit-timestamp }}
           VERGEN_GIT_DESCRIBE: ${{ needs.prepare.outputs.git-describe }}
           VERGEN_GIT_SHA: ${{ github.sha }}
@@ -396,7 +405,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             SOURCE_DATE_EPOCH=${{ needs.prepare.outputs.source-date-epoch }}
-            VERGEN_GIT_BRANCH=${{ github.ref_name }}
+            VERGEN_GIT_BRANCH=${{ needs.prepare.outputs.source-branch }}
             VERGEN_GIT_COMMIT_TIMESTAMP=${{ needs.prepare.outputs.commit-timestamp }}
             VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.git-describe }}
             VERGEN_GIT_SHA=${{ github.sha }}

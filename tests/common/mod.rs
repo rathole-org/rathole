@@ -10,12 +10,15 @@ use tokio::{
 pub const PING: &str = "ping";
 pub const PONG: &str = "pong";
 
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+pub mod tls;
+
 pub async fn run_rathole_server(
-    config_path: &str,
+    config_path: PathBuf,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let cli = rathole::Cli {
-        config_path: Some(PathBuf::from(config_path)),
+        config_path: Some(config_path),
         server: true,
         client: false,
         ..Default::default()
@@ -24,11 +27,11 @@ pub async fn run_rathole_server(
 }
 
 pub async fn run_rathole_client(
-    config_path: &str,
+    config_path: PathBuf,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let cli = rathole::Cli {
-        config_path: Some(PathBuf::from(config_path)),
+        config_path: Some(config_path),
         server: false,
         client: true,
         ..Default::default()

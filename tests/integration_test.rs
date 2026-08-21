@@ -1,13 +1,15 @@
-use anyhow::{anyhow, Ok, Result};
+use anyhow::{anyhow, Context, Result};
 use common::{run_rathole_client, PING, PONG};
 use rand::Rng;
 use rand::RngCore;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::Path;
 use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpStream, UdpSocket},
     sync::broadcast,
+    task::{JoinHandle, JoinSet},
     time,
 };
 use tracing::{debug, info, instrument};
@@ -29,6 +31,9 @@ const ECHO_SERVER_SOCKET_EXPOSED: &str = "/tmp/rathole_integration_test/echo_exp
 const PINGPONG_SERVER_SOCKET_EXPOSED: &str = "/tmp/rathole_integration_test/pingpong_exposed.sock";
 
 const HITTER_NUM: usize = 4;
+const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+const TLS_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 const PP2_SIG: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
@@ -80,7 +85,7 @@ async fn tcp() -> Result<()> {
          // On other OS accept run with either
          all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
      ))]
-    test("tests/for_tcp/tls_transport.toml", Type::Tcp).await?;
+    test_tls("tests/for_tcp/tls_transport.toml", Type::Tcp).await?;
 
     #[cfg(feature = "noise")]
     test("tests/for_tcp/noise_transport.toml", Type::Tcp).await?;
@@ -90,7 +95,7 @@ async fn tcp() -> Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;
+    test_tls("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;
 
     Ok(())
 }
@@ -121,7 +126,7 @@ async fn udp() -> Result<()> {
          // On other OS accept run with either
          all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
      ))]
-    test("tests/for_udp/tls_transport.toml", Type::Udp).await?;
+    test_tls("tests/for_udp/tls_transport.toml", Type::Udp).await?;
 
     #[cfg(feature = "noise")]
     test("tests/for_udp/noise_transport.toml", Type::Udp).await?;
@@ -131,7 +136,7 @@ async fn udp() -> Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
+    test_tls("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
 
     Ok(())
 }
@@ -170,7 +175,7 @@ async fn socket_stream() -> Result<()> {
          // On other OS accept run with either
          all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
      ))]
-    test(
+    test_tls(
         "tests/for_socket_stream/tls_transport.toml",
         Type::SocketStream,
     )
@@ -192,7 +197,7 @@ async fn socket_stream() -> Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test(
+    test_tls(
         "tests/for_socket_stream/websocket_tls_transport.toml",
         Type::SocketStream,
     )
@@ -202,106 +207,303 @@ async fn socket_stream() -> Result<()> {
 }
 
 #[instrument]
-async fn test(config_path: &'static str, t: Type) -> Result<()> {
+async fn test(config_path: impl AsRef<Path> + std::fmt::Debug, t: Type) -> Result<()> {
+    test_with_timeout(config_path, t, None).await
+}
+
+async fn test_with_timeout(
+    config_path: impl AsRef<Path>,
+    t: Type,
+    timeout: Option<Duration>,
+) -> Result<()> {
     if cfg!(not(all(feature = "client", feature = "server"))) {
         // Skip the test if the client or the server is not enabled
         return Ok(());
     }
 
-    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
-    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let mut processes = TestProcesses::new(config_path.as_ref().to_path_buf());
+    let scenario = run_scenario(&mut processes, t);
+    let scenario_result = match timeout {
+        Some(timeout) => match time::timeout(timeout, scenario).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "integration test timed out after {} seconds",
+                timeout.as_secs()
+            )),
+        },
+        None => scenario.await,
+    };
+    let cleanup_result = processes.shutdown().await;
 
-    // Start the client
+    finish_scenario(scenario_result, cleanup_result)
+}
+
+fn finish_scenario(scenario_result: Result<()>, cleanup_result: Result<()>) -> Result<()> {
+    match (scenario_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(scenario_error), Ok(())) => Err(scenario_error),
+        (Err(scenario_error), Err(cleanup_error)) => Err(scenario_error.context(format!(
+            "integration-test process cleanup also failed: {cleanup_error:#}"
+        ))),
+    }
+}
+
+async fn run_scenario(processes: &mut TestProcesses, t: Type) -> Result<()> {
     info!("start the client");
-    let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
-            .await
-            .unwrap();
-    });
+    processes.start_client();
 
     // Sleep for 1 second. Expect the client keep retrying to reach the server
     time::sleep(Duration::from_secs(1)).await;
+    processes.check_client_running().await?;
 
-    // Start the server
     info!("start the server");
-    let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
-            .await
-            .unwrap();
-    });
+    processes.start_server();
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
+    processes.check_running().await?;
 
     info!("echo");
-    echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
+    echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await?;
     info!("pingpong");
-    pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
-        .await
-        .unwrap();
+    pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t).await?;
 
     // Simulate the client crash and restart
     info!("shutdown the client");
-    client_shutdown_tx.send(true)?;
-    let _ = tokio::join!(client);
+    processes.stop_client().await?;
 
     info!("restart the client");
-    let client_shutdown_rx = client_shutdown_tx.subscribe();
-    let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
-            .await
-            .unwrap();
-    });
+    processes.start_client();
     time::sleep(Duration::from_secs(1)).await; // Wait for the client to start
+    processes.check_running().await?;
 
     info!("echo");
-    echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
+    echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await?;
     info!("pingpong");
-    pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
-        .await
-        .unwrap();
+    pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t).await?;
 
     // Simulate the server crash and restart
     info!("shutdown the server");
-    server_shutdown_tx.send(true)?;
-    let _ = tokio::join!(server);
+    processes.stop_server().await?;
 
     info!("restart the server");
-    let server_shutdown_rx = server_shutdown_tx.subscribe();
-    let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
-            .await
-            .unwrap();
-    });
+    processes.start_server();
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
+    processes.check_running().await?;
 
     // Simulate heavy load
     info!("lots of echo and pingpong");
 
-    let mut v = Vec::new();
+    let mut hitters = JoinSet::new();
 
     for _ in 0..HITTER_NUM / 2 {
-        v.push(tokio::spawn(async move {
-            echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
-        }));
+        hitters.spawn(async move { echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await });
 
-        v.push(tokio::spawn(async move {
-            pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
-                .await
-                .unwrap();
-        }));
+        hitters.spawn(async move { pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t).await });
     }
 
-    for h in v {
-        assert!(tokio::join!(h).0.is_ok());
+    while let Some(result) = hitters.join_next().await {
+        result.context("traffic task panicked")??;
     }
-
-    // Shutdown
-    info!("shutdown the server and the client");
-    server_shutdown_tx.send(true)?;
-    client_shutdown_tx.send(true)?;
-
-    let _ = tokio::join!(server, client);
 
     Ok(())
+}
+
+struct TestProcesses {
+    config_path: std::path::PathBuf,
+    client_shutdown_tx: broadcast::Sender<bool>,
+    server_shutdown_tx: broadcast::Sender<bool>,
+    client: Option<JoinHandle<Result<()>>>,
+    server: Option<JoinHandle<Result<()>>>,
+}
+
+impl TestProcesses {
+    fn new(config_path: std::path::PathBuf) -> Self {
+        let (client_shutdown_tx, _) = broadcast::channel(1);
+        let (server_shutdown_tx, _) = broadcast::channel(1);
+        Self {
+            config_path,
+            client_shutdown_tx,
+            server_shutdown_tx,
+            client: None,
+            server: None,
+        }
+    }
+
+    fn start_client(&mut self) {
+        assert!(self.client.is_none(), "client is already running");
+        let config_path = self.config_path.clone();
+        let shutdown_rx = self.client_shutdown_tx.subscribe();
+        self.client = Some(tokio::spawn(async move {
+            run_rathole_client(config_path, shutdown_rx).await
+        }));
+    }
+
+    fn start_server(&mut self) {
+        assert!(self.server.is_none(), "server is already running");
+        let config_path = self.config_path.clone();
+        let shutdown_rx = self.server_shutdown_tx.subscribe();
+        self.server = Some(tokio::spawn(async move {
+            run_rathole_server(config_path, shutdown_rx).await
+        }));
+    }
+
+    async fn stop_client(&mut self) -> Result<()> {
+        stop_task(
+            "client",
+            &self.client_shutdown_tx,
+            &mut self.client,
+            TASK_SHUTDOWN_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn stop_server(&mut self) -> Result<()> {
+        stop_task(
+            "server",
+            &self.server_shutdown_tx,
+            &mut self.server,
+            TASK_SHUTDOWN_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn check_running(&mut self) -> Result<()> {
+        check_task("client", &mut self.client).await?;
+        check_task("server", &mut self.server).await
+    }
+
+    async fn check_client_running(&mut self) -> Result<()> {
+        check_task("client", &mut self.client).await
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        info!("shutdown the server and the client");
+        // Signal both sides before waiting because either side can be blocked on
+        // work owned by the other.
+        let _ = self.server_shutdown_tx.send(true);
+        let _ = self.client_shutdown_tx.send(true);
+        let server_result = self.stop_server().await;
+        let client_result = self.stop_client().await;
+        match (server_result, client_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(server_error), Err(client_error)) => Err(anyhow!(
+                "server cleanup failed: {server_error:#}; client cleanup failed: {client_error:#}"
+            )),
+        }
+    }
+}
+
+impl Drop for TestProcesses {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            client.abort();
+        }
+        if let Some(server) = self.server.take() {
+            server.abort();
+        }
+    }
+}
+
+async fn check_task(name: &str, task: &mut Option<JoinHandle<Result<()>>>) -> Result<()> {
+    let Some(running_task) = task.as_ref() else {
+        return Err(anyhow!("{name} is not running"));
+    };
+    if !running_task.is_finished() {
+        return Ok(());
+    }
+
+    let result = task
+        .take()
+        .expect("finished task should exist")
+        .await
+        .with_context(|| format!("{name} task panicked"))?;
+    match result {
+        Ok(()) => Err(anyhow!("{name} exited unexpectedly")),
+        Err(error) => Err(error).with_context(|| format!("{name} exited unexpectedly")),
+    }
+}
+
+async fn stop_task(
+    name: &str,
+    shutdown_tx: &broadcast::Sender<bool>,
+    task: &mut Option<JoinHandle<Result<()>>>,
+    shutdown_timeout: Duration,
+) -> Result<()> {
+    let Some(running_task) = task.as_mut() else {
+        return Ok(());
+    };
+
+    let _ = shutdown_tx.send(true);
+    match time::timeout(shutdown_timeout, running_task).await {
+        Ok(join_result) => {
+            task.take();
+            join_result
+                .with_context(|| format!("{name} task panicked"))?
+                .with_context(|| format!("{name} failed while shutting down"))
+        }
+        Err(_) => {
+            let task = task.take().expect("running task should exist");
+            task.abort();
+            let _ = task.await;
+            Err(anyhow!("{name} did not stop within {shutdown_timeout:?}"))
+        }
+    }
+}
+
+#[tokio::test]
+async fn stop_task_aborts_an_unresponsive_task() {
+    let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+    let mut task = Some(tokio::spawn(async move {
+        let _ = shutdown_rx.recv().await;
+        std::future::pending::<Result<()>>().await
+    }));
+
+    let result = stop_task(
+        "test task",
+        &shutdown_tx,
+        &mut task,
+        Duration::from_millis(10),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(task.is_none());
+}
+
+#[tokio::test]
+async fn cancelling_stop_keeps_the_task_managed() {
+    let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+    let mut task = Some(tokio::spawn(async move {
+        let _ = shutdown_rx.recv().await;
+        std::future::pending::<Result<()>>().await
+    }));
+
+    let result = time::timeout(
+        Duration::from_millis(10),
+        stop_task("test task", &shutdown_tx, &mut task, Duration::from_secs(1)),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(task.is_some());
+
+    let result = stop_task(
+        "test task",
+        &shutdown_tx,
+        &mut task,
+        Duration::from_millis(10),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(task.is_none());
+}
+
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+async fn test_tls(config_template: impl AsRef<Path>, t: Type) -> Result<()> {
+    let config = common::tls::TlsTestConfig::from_template(config_template)?;
+    test_with_timeout(config.path(), t, Some(TLS_TEST_TIMEOUT)).await?;
+    config.close()
 }
 
 async fn echo_hitter(addr: &'static str, t: Type) -> Result<()> {
@@ -440,40 +642,27 @@ async fn test_proxy_protocol(config_path: &'static str) -> Result<()> {
         return Ok(());
     }
 
-    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
-    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let mut processes = TestProcesses::new(config_path.into());
+    let scenario_result = async {
+        info!("start the client");
+        processes.start_client();
+        time::sleep(Duration::from_secs(1)).await;
+        processes.check_client_running().await?;
 
-    info!("start the client");
-    let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
-            .await
-            .unwrap();
-    });
+        info!("start the server");
+        processes.start_server();
+        time::sleep(Duration::from_millis(2500)).await;
+        processes.check_running().await?;
 
-    time::sleep(Duration::from_secs(1)).await;
+        info!("echo");
+        tcp_echo_hitter_expect_proxy_protocol(ECHO_SERVER_ADDR_EXPOSED).await?;
 
-    info!("start the server");
-    let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
-            .await
-            .unwrap();
-    });
-
-    time::sleep(Duration::from_millis(2500)).await;
-
-    info!("echo");
-    tcp_echo_hitter_expect_proxy_protocol(ECHO_SERVER_ADDR_EXPOSED).await?;
-
-    info!("pingpong )");
-    tcp_pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED).await?;
-
-    info!("shutdown the server and the client");
-    server_shutdown_tx.send(true)?;
-    client_shutdown_tx.send(true)?;
-
-    let _ = tokio::join!(server, client);
-
-    Ok(())
+        info!("pingpong");
+        tcp_pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED).await
+    }
+    .await;
+    let cleanup_result = processes.shutdown().await;
+    finish_scenario(scenario_result, cleanup_result)
 }
 
 async fn read_proxy_protocol_header(

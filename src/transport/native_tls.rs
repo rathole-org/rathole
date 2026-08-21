@@ -51,13 +51,14 @@ impl Transport for TlsTransport {
 
         let tls_acceptor = match config.pkcs12.as_ref() {
             Some(path) => {
-                let ident = Identity::from_pkcs12(
-                    &fs::read(path)?,
-                    config.pkcs12_password.as_ref().unwrap(),
-                )
-                .with_context(|| "Failed to create identitiy")?;
+                let password = config
+                    .pkcs12_password
+                    .as_ref()
+                    .context("Missing `tls.pkcs12_password`")?;
+                let ident = Identity::from_pkcs12(&fs::read(path)?, password)
+                    .with_context(|| "Failed to create identity")?;
                 Some(TlsAcceptor::from(
-                    native_tls::TlsAcceptor::new(ident).unwrap(),
+                    native_tls::TlsAcceptor::new(ident).context("Failed to create TLS acceptor")?,
                 ))
             }
             None => None,
@@ -113,4 +114,34 @@ impl Transport for TlsTransport {
 #[cfg(feature = "websocket-native-tls")]
 pub(crate) fn get_tcpstream(s: &TlsStream<TcpStream>) -> &TcpStream {
     s.get_ref().get_ref().get_ref()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{TlsConfig, TransportType};
+    use std::path::Path;
+
+    fn server_transport(identity_path: &Path) -> TransportConfig {
+        TransportConfig {
+            transport_type: TransportType::Tls,
+            tls: Some(TlsConfig {
+                hostname: None,
+                trusted_root: None,
+                pkcs12: Some(identity_path.to_string_lossy().into_owned()),
+                pkcs12_password: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn missing_identity_password_returns_error() -> Result<()> {
+        let identity = tempfile::NamedTempFile::new()?;
+        let result = TlsTransport::new(&server_transport(identity.path()));
+
+        let error = result.expect_err("missing PKCS#12 password should fail");
+        assert!(error.to_string().contains("tls.pkcs12_password"));
+        Ok(())
+    }
 }

@@ -37,7 +37,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 ## Quickstart
 
-A full-powered `rathole` can be obtained from the [release](https://github.com/rathole-org/rathole/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**. A [container image](https://github.com/orgs/rathole-org/packages/container/package/rathole) is also available from GHCR.
+Release archives ending in `-embedded` use a smaller feature set and omit TLS and WebSocket transports. Other binaries on the [release](https://github.com/rathole-org/rathole/releases) page are full-featured. You can also [build from source](docs/build-guide.md) **for other platforms or to minimize the binary**. A [container image](https://github.com/orgs/rathole-org/packages/container/package/rathole) is available from GHCR.
 
 The usage of `rathole` is very similar to frp. If you have experience with the latter, then the configuration is very easy for you. The only difference is that configuration of a service is split into the client side and the server side, and a token is mandatory.
 

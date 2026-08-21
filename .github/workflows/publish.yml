@@ -204,54 +204,63 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            archive_target: x86_64-unknown-linux-gnu
             binary: rathole
             builder: cargo
             feature-set: default
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            archive_target: x86_64-pc-windows-msvc
             binary: rathole.exe
             builder: cargo
             feature-set: default
           - name: macos-x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
+            archive_target: x86_64-apple-darwin
             binary: rathole
             builder: cargo
             feature-set: default
           - name: macos-arm64
             os: macos-15
             target: aarch64-apple-darwin
+            archive_target: aarch64-apple-darwin
             binary: rathole
             builder: cargo
             feature-set: default
           - name: linux-x86_64-musl
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            archive_target: x86_64-unknown-linux-musl
             binary: rathole
             builder: cross
             feature-set: default-musl
           - name: linux-arm64-musl
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
+            archive_target: aarch64-unknown-linux-musl-embedded
             binary: rathole
             builder: cross
             feature-set: embedded
           - name: linux-arm-musleabi
             os: ubuntu-latest
             target: arm-unknown-linux-musleabi
+            archive_target: arm-unknown-linux-musleabi-embedded
             binary: rathole
             builder: cross
             feature-set: embedded
           - name: linux-arm-musleabihf
             os: ubuntu-latest
             target: arm-unknown-linux-musleabihf
+            archive_target: arm-unknown-linux-musleabihf-embedded
             binary: rathole
             builder: cross
             feature-set: embedded
           - name: linux-armv7-musleabihf
             os: ubuntu-latest
             target: armv7-unknown-linux-musleabihf
+            archive_target: armv7-unknown-linux-musleabihf-embedded
             binary: rathole
             builder: cross
             feature-set: embedded
@@ -305,7 +314,7 @@ jobs:
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: binary-${{ matrix.target }}
+          name: binary-${{ matrix.archive_target }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary }}
           if-no-files-found: error
           compression-level: 0
@@ -511,22 +520,22 @@ jobs:
             'x86_64-apple-darwin|rathole'
             'aarch64-apple-darwin|rathole'
             'x86_64-unknown-linux-musl|rathole'
-            'aarch64-unknown-linux-musl|rathole'
-            'arm-unknown-linux-musleabi|rathole'
-            'arm-unknown-linux-musleabihf|rathole'
-            'armv7-unknown-linux-musleabihf|rathole'
+            'aarch64-unknown-linux-musl-embedded|rathole'
+            'arm-unknown-linux-musleabi-embedded|rathole'
+            'arm-unknown-linux-musleabihf-embedded|rathole'
+            'armv7-unknown-linux-musleabihf-embedded|rathole'
           )
 
           mkdir -p dist
           for entry in "${targets[@]}"; do
-            IFS='|' read -r target binary <<< "${entry}"
-            source="staging/binary-${target}/${binary}"
+            IFS='|' read -r archive_target binary <<< "${entry}"
+            source="staging/binary-${archive_target}/${binary}"
             if [[ ! -f "${source}" ]]; then
               echo "::error::Missing binary ${source}"
               exit 1
             fi
 
-            archive="rathole-${VERSION}-${target}"
+            archive="rathole-${VERSION}-${archive_target}"
             install -d -m 0755 "dist/${archive}"
             install -m 0755 "${source}" "dist/${archive}/${binary}"
             install -m 0644 LICENSE README.md "dist/${archive}/"

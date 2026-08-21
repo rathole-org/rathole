@@ -36,7 +36,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 
 ## Quickstart
 
-一个全功能的 `rathole` 可以从 [release](https://github.com/rathole-org/rathole/releases) 页面下载。或者 [从源码编译](docs/build-guide.md) **获取其他平台和最小化的二进制文件**。
+[release](https://github.com/rathole-org/rathole/releases) 页面中，文件名以 `-embedded` 结尾的压缩包使用精简功能集，不包含 TLS 和 WebSocket 传输；其他二进制文件为全功能版本。也可以 [从源码编译](docs/build-guide.md) **获取其他平台或最小化的二进制文件**。
 
 `rathole` 的使用和 frp 非常类似，如果你有后者的使用经验，那配置对你来说非常简单，区别只是转发服务的配置分离到了服务端和客户端，并且必须要设置 token。
 

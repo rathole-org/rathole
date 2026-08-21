@@ -42,6 +42,7 @@ jobs:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
+          cache: false
           toolchain: ${{ env.RUST_VERSION }}
           rustflags: ""
       - name: Resolve publishing channel
@@ -260,6 +261,7 @@ jobs:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
+          cache: false
           toolchain: ${{ env.RUST_VERSION }}
           target: ${{ matrix.target }}
           rustflags: ""
@@ -446,6 +448,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.prepare.outputs.channel != 'dev'
         with:
+          cache: false
           toolchain: ${{ env.RUST_VERSION }}
           rustflags: ""
       - name: Publish crate version

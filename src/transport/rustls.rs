@@ -181,7 +181,7 @@ impl Transport for TlsTransport {
 }
 
 pub(crate) fn get_tcpstream(s: &TlsStream<TcpStream>) -> &TcpStream {
-    &s.get_ref().0
+    s.get_ref().0
 }
 
 #[cfg(test)]

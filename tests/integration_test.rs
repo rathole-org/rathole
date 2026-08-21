@@ -2,9 +2,13 @@ use anyhow::{anyhow, Context, Result};
 use common::{run_rathole_client, PING, PONG};
 use rand::Rng;
 use rand::RngCore;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::Path;
+use std::ops::AsyncFnOnce;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+use tokio::sync::oneshot;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpStream, UdpSocket},
@@ -32,8 +36,9 @@ const PINGPONG_SERVER_SOCKET_EXPOSED: &str = "/tmp/rathole_integration_test/ping
 
 const HITTER_NUM: usize = 4;
 const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const INTEGRATION_SCENARIO_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
-const TLS_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+const TLS_SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 const PP2_SIG: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
@@ -208,44 +213,71 @@ async fn socket_stream() -> Result<()> {
 
 #[instrument]
 async fn test(config_path: impl AsRef<Path> + std::fmt::Debug, t: Type) -> Result<()> {
-    test_with_timeout(config_path, t, None).await
-}
-
-async fn test_with_timeout(
-    config_path: impl AsRef<Path>,
-    t: Type,
-    timeout: Option<Duration>,
-) -> Result<()> {
     if cfg!(not(all(feature = "client", feature = "server"))) {
-        // Skip the test if the client or the server is not enabled
         return Ok(());
     }
 
-    let mut processes = TestProcesses::new(config_path.as_ref().to_path_buf());
-    let scenario = run_scenario(&mut processes, t);
-    let scenario_result = match timeout {
-        Some(timeout) => match time::timeout(timeout, scenario).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!(
-                "integration test timed out after {} seconds",
-                timeout.as_secs()
-            )),
-        },
-        None => scenario.await,
-    };
-    let cleanup_result = processes.shutdown().await;
-
-    finish_scenario(scenario_result, cleanup_result)
+    run_managed_scenario(
+        config_path.as_ref().to_path_buf(),
+        "traffic scenario",
+        INTEGRATION_SCENARIO_TIMEOUT,
+        async move |processes| run_scenario(processes, t).await,
+    )
+    .await
 }
 
-fn finish_scenario(scenario_result: Result<()>, cleanup_result: Result<()>) -> Result<()> {
+async fn run_managed_scenario(
+    config_path: PathBuf,
+    phase: &'static str,
+    timeout: Duration,
+    scenario: impl AsyncFnOnce(&mut TestProcesses) -> Result<()>,
+) -> Result<()> {
+    let mut processes = TestProcesses::new(config_path.clone());
+    let scenario_result =
+        run_with_timeout(&config_path, phase, timeout, scenario(&mut processes)).await;
+    let cleanup_result = processes.shutdown().await;
+
+    finish_with_cleanup(
+        scenario_result,
+        cleanup_result,
+        "integration-test process cleanup",
+    )
+}
+
+async fn run_with_timeout<T>(
+    config_path: &Path,
+    phase: &str,
+    timeout: Duration,
+    operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match time::timeout(timeout, operation).await {
+        Ok(result) => result.with_context(|| {
+            format!(
+                "integration test `{}` failed during {phase}",
+                config_path.display()
+            )
+        }),
+        Err(_) => Err(anyhow!(
+            "integration test `{}` timed out during {phase} after {timeout:?}",
+            config_path.display()
+        )),
+    }
+}
+
+fn finish_with_cleanup(
+    scenario_result: Result<()>,
+    cleanup_result: Result<()>,
+    cleanup_name: &str,
+) -> Result<()> {
     match (scenario_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Ok(()), Err(cleanup_error)) => {
+            Err(cleanup_error).with_context(|| format!("{cleanup_name} failed"))
+        }
         (Err(scenario_error), Ok(())) => Err(scenario_error),
-        (Err(scenario_error), Err(cleanup_error)) => Err(scenario_error.context(format!(
-            "integration-test process cleanup also failed: {cleanup_error:#}"
-        ))),
+        (Err(scenario_error), Err(cleanup_error)) => {
+            Err(scenario_error.context(format!("{cleanup_name} also failed: {cleanup_error:#}")))
+        }
     }
 }
 
@@ -499,11 +531,96 @@ async fn cancelling_stop_keeps_the_task_managed() {
     assert!(task.is_none());
 }
 
+#[tokio::test]
+async fn scenario_timeout_reports_phase_and_cleans_up_tasks() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let shutdown_count = Arc::new(AtomicUsize::new(0));
+    let scenario_shutdown_count = Arc::clone(&shutdown_count);
+    let result = run_managed_scenario(
+        PathBuf::from("tests/stalled-traffic.toml"),
+        "stalled traffic scenario",
+        Duration::from_millis(10),
+        async move |processes| {
+            let mut client_shutdown_rx = processes.client_shutdown_tx.subscribe();
+            let client_shutdown_count = Arc::clone(&scenario_shutdown_count);
+            processes.client = Some(tokio::spawn(async move {
+                // shutdown() sends twice through a one-slot channel. Production
+                // shutdown receivers finish on either a value or a lag error.
+                assert!(matches!(
+                    client_shutdown_rx.recv().await,
+                    Ok(true) | Err(broadcast::error::RecvError::Lagged(_))
+                ));
+                client_shutdown_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }));
+
+            let mut server_shutdown_rx = processes.server_shutdown_tx.subscribe();
+            let server_shutdown_count = Arc::clone(&scenario_shutdown_count);
+            processes.server = Some(tokio::spawn(async move {
+                // See the matching client task above.
+                assert!(matches!(
+                    server_shutdown_rx.recv().await,
+                    Ok(true) | Err(broadcast::error::RecvError::Lagged(_))
+                ));
+                server_shutdown_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }));
+
+            std::future::pending::<Result<()>>().await
+        },
+    )
+    .await;
+
+    let error = format!(
+        "{:#}",
+        result.expect_err("stalled scenario should time out")
+    );
+    assert!(error.contains("tests/stalled-traffic.toml"));
+    assert!(error.contains("stalled traffic scenario"));
+    assert!(error.contains("10ms"));
+    assert!(!error.contains("cleanup"));
+    assert_eq!(shutdown_count.load(Ordering::SeqCst), 2);
+}
+
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
 async fn test_tls(config_template: impl AsRef<Path>, t: Type) -> Result<()> {
-    let config = common::tls::TlsTestConfig::from_template(config_template)?;
-    test_with_timeout(config.path(), t, Some(TLS_TEST_TIMEOUT)).await?;
-    config.close()
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+
+    let template_path = config_template.as_ref().to_path_buf();
+    let generation_path = template_path.clone();
+    let config = run_with_timeout(
+        &template_path,
+        "TLS artifact setup",
+        TLS_SETUP_TIMEOUT,
+        generate_tls_test_config(generation_path),
+    )
+    .await?;
+
+    let scenario_result = test(config.path(), t).await;
+    let cleanup_result = config.close();
+    finish_with_cleanup(scenario_result, cleanup_result, "TLS artifact cleanup")
+}
+
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+async fn generate_tls_test_config(template_path: PathBuf) -> Result<common::tls::TlsTestConfig> {
+    let (result_tx, result_rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("rathole-tls-test-setup".to_owned())
+        .spawn(move || {
+            let result = common::tls::TlsTestConfig::from_template(template_path);
+            let _ = result_tx.send(result);
+        })
+        .context("failed to spawn TLS artifact setup thread")?;
+
+    result_rx
+        .await
+        .context("TLS artifact setup thread panicked")?
 }
 
 async fn echo_hitter(addr: &'static str, t: Type) -> Result<()> {
@@ -642,27 +759,29 @@ async fn test_proxy_protocol(config_path: &'static str) -> Result<()> {
         return Ok(());
     }
 
-    let mut processes = TestProcesses::new(config_path.into());
-    let scenario_result = async {
-        info!("start the client");
-        processes.start_client();
-        time::sleep(Duration::from_secs(1)).await;
-        processes.check_client_running().await?;
+    run_managed_scenario(
+        config_path.into(),
+        "proxy-protocol traffic scenario",
+        INTEGRATION_SCENARIO_TIMEOUT,
+        async |processes| {
+            info!("start the client");
+            processes.start_client();
+            time::sleep(Duration::from_secs(1)).await;
+            processes.check_client_running().await?;
 
-        info!("start the server");
-        processes.start_server();
-        time::sleep(Duration::from_millis(2500)).await;
-        processes.check_running().await?;
+            info!("start the server");
+            processes.start_server();
+            time::sleep(Duration::from_millis(2500)).await;
+            processes.check_running().await?;
 
-        info!("echo");
-        tcp_echo_hitter_expect_proxy_protocol(ECHO_SERVER_ADDR_EXPOSED).await?;
+            info!("echo");
+            tcp_echo_hitter_expect_proxy_protocol(ECHO_SERVER_ADDR_EXPOSED).await?;
 
-        info!("pingpong");
-        tcp_pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED).await
-    }
-    .await;
-    let cleanup_result = processes.shutdown().await;
-    finish_scenario(scenario_result, cleanup_result)
+            info!("pingpong");
+            tcp_pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED).await
+        },
+    )
+    .await
 }
 
 async fn read_proxy_protocol_header(

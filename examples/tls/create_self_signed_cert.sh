@@ -62,7 +62,7 @@ openssl x509 -req \
     -days 365 \
     -sha256 -extfile cert.conf
 
-# create pkcs12
+# create a PKCS#12 identity compatible with both native-tls and rustls
 openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile rootCA.crt \
     -passout pass:1234 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
 

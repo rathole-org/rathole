@@ -43,15 +43,18 @@ are intentionally not committed):
 
 ### Rustls Support
 
-`rathole` provides optional `rustls` support. [Build Guide](build-guide.md) demostrated this.
+`rathole` provides optional `rustls` support. See the [build guide](build-guide.md).
 
-One difference is that, the crate we use for loading PKCS#12 archives can only handle limited types of PBE algorithms. We only support PKCS#12 archives that they (crate `p12`) support. So we need to specify the legacy format (openssl 1.x format) when creating the PKCS#12 archive.
-
-In short, the command used with openssl 3 to create the PKCS#12 archive with `rustls` support is:
+The `rustls` backend uses the `p12` crate to load PKCS#12 archives and supports
+legacy PBE algorithms. With OpenSSL 3, explicitly use 3DES for both the key and
+certificate bags to create an identity that works with both TLS backends:
 
 ```sh
-openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile ca_chain_certs.crt -legacy
+openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt \
+  -certfile ca_chain_certs.crt -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
 ```
+
+The provided example script creates this compatible format automatically.
 
 ## Noise Protocol
 

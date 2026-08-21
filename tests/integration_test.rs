@@ -1,3 +1,5 @@
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+use anyhow::Context;
 use anyhow::{anyhow, Ok, Result};
 use common::{run_rathole_client, PING, PONG};
 use rand::Rng;
@@ -30,6 +32,8 @@ const ECHO_SERVER_SOCKET_EXPOSED: &str = "/tmp/rathole_integration_test/echo_exp
 const PINGPONG_SERVER_SOCKET_EXPOSED: &str = "/tmp/rathole_integration_test/pingpong_exposed.sock";
 
 const HITTER_NUM: usize = 4;
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+const TLS_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 const PP2_SIG: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
@@ -314,9 +318,10 @@ async fn test(config_path: impl AsRef<Path> + std::fmt::Debug, t: Type) -> Resul
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
 async fn test_tls(config_template: impl AsRef<Path>, t: Type) -> Result<()> {
     let config = common::tls::TlsTestConfig::from_template(config_template)?;
-    let result = test(config.path(), t).await;
-    config.close()?;
-    result
+    time::timeout(TLS_TEST_TIMEOUT, test(config.path(), t))
+        .await
+        .context("TLS integration test timed out")??;
+    config.close()
 }
 
 async fn echo_hitter(addr: &'static str, t: Type) -> Result<()> {

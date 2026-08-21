@@ -15,7 +15,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use p12_keystore::{KeyStore, Pkcs12ImportPolicy};
+use p12::PFX;
 
 pub struct TlsTransport {
     tcp: TcpTransport,
@@ -37,18 +37,18 @@ impl Debug for TlsTransport {
 fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
     if let Some(pkcs12_path) = config.pkcs12.as_ref() {
         let buf = fs::read(pkcs12_path)?;
+        let pfx = PFX::parse(buf.as_slice())?;
         let pass = config.pkcs12_password.as_ref().unwrap();
-        let key_store = KeyStore::from_pkcs12(&buf, pass, Pkcs12ImportPolicy::Strict)?;
-        let (_, key_chain) = key_store
-            .private_key_chain()
-            .context("PKCS#12 identity contains no private key")?;
 
-        let chain: Vec<CertificateDer> = key_chain
-            .certs()
-            .iter()
-            .map(|cert| CertificateDer::from(cert.as_der().to_vec()))
-            .collect();
-        let key = PrivatePkcs8KeyDer::from(key_chain.key().as_der().to_vec());
+        let certs = pfx.cert_bags(pass)?;
+        let keys = pfx.key_bags(pass)?;
+
+        let chain: Vec<CertificateDer> = certs.into_iter().map(CertificateDer::from).collect();
+        let key = keys
+            .into_iter()
+            .next()
+            .map(PrivatePkcs8KeyDer::from)
+            .context("PKCS#12 identity contains no private key")?;
 
         Ok(Some(
             ServerConfig::builder()

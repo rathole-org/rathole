@@ -17,6 +17,18 @@ use toml::Value;
 const KEEP_CERTS_ENV: &str = "RATHOLE_TEST_KEEP_CERTS";
 const PKCS12_PASSWORD: &str = "rathole-integration-test";
 
+// The rustls `p12` loader supports legacy PBE. Native TLS uses modern PBES2
+// here to avoid platform/provider-dependent support for legacy algorithms.
+#[cfg(feature = "rustls")]
+const PKCS12_ENCRYPTION: EncryptionAlgorithm = EncryptionAlgorithm::PbeWithShaAnd3KeyTripleDesCbc;
+#[cfg(feature = "rustls")]
+const PKCS12_MAC: MacAlgorithm = MacAlgorithm::HmacSha1;
+
+#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+const PKCS12_ENCRYPTION: EncryptionAlgorithm = EncryptionAlgorithm::PbeWithHmacSha256AndAes256;
+#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+const PKCS12_MAC: MacAlgorithm = MacAlgorithm::HmacSha256;
+
 /// A rendered integration-test config and its per-test TLS artifacts.
 ///
 /// Artifacts are deleted when this value is dropped. Set
@@ -84,8 +96,8 @@ impl TlsTestConfig {
         );
         let identity = key_store
             .writer(PKCS12_PASSWORD)
-            .encryption_algorithm(EncryptionAlgorithm::PbeWithHmacSha256AndAes256)
-            .mac_algorithm(MacAlgorithm::HmacSha256)
+            .encryption_algorithm(PKCS12_ENCRYPTION)
+            .mac_algorithm(PKCS12_MAC)
             .write()
             .context("failed to create test PKCS#12 identity")?;
 

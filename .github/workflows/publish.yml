@@ -301,24 +301,10 @@ jobs:
           else
             cargo "${build_args[@]}"
           fi
-      - name: Package binary
-        shell: bash
-        env:
-          BINARY: ${{ matrix.binary }}
-          TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          archive="rathole-${VERSION}-${TARGET}"
-          mkdir -p "dist/${archive}"
-          cp "target/${TARGET}/release/${BINARY}" "dist/${archive}/"
-          cp LICENSE README.md "dist/${archive}/"
-          tar -czf "dist/${archive}.tar.gz" -C dist "${archive}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binary-${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -333,7 +319,7 @@ jobs:
       contents: read
       packages: write
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      digest: ${{ steps.digest.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -345,12 +331,40 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Find existing tagged image
+        id: existing
+        if: needs.prepare.outputs.channel != 'dev'
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          image_ref="${IMAGE}:${VERSION}"
+          if inspection="$(docker buildx imagetools inspect "${image_ref}" 2>&1)"; then
+            digest="$(sed -n 's/^Digest:[[:space:]]*//p' <<< "${inspection}" | head -n 1)"
+            if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Could not resolve the digest for ${image_ref}"
+              exit 1
+            fi
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          elif grep -Fqi 'manifest unknown' <<< "${inspection}" ||
+               grep -Fqi "${image_ref}: not found" <<< "${inspection}"; then
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          else
+            printf '%s\n' "${inspection}" >&2
+            echo "::error::Could not check whether ${image_ref} already exists"
+            exit 1
+          fi
       - name: Generate container metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
           flavor: latest=false
+          labels: |
+            org.opencontainers.image.created=${{ needs.prepare.outputs.commit-timestamp }}
           tags: |
             type=raw,value=dev,enable=${{ needs.prepare.outputs.channel == 'dev' }}
             type=raw,value=dev-${{ github.sha }},enable=${{ needs.prepare.outputs.channel == 'dev' }}
@@ -360,6 +374,7 @@ jobs:
             type=raw,value=latest,enable=${{ needs.prepare.outputs.publish-latest-alias == 'true' }}
       - name: Build and push container
         id: build
+        if: steps.existing.outputs.exists != 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -378,10 +393,30 @@ jobs:
           cache-to: type=gha,mode=max,scope=publish
           provenance: mode=max
           sbom: true
+      - name: Resolve container digest
+        id: digest
+        shell: bash
+        env:
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+          EXISTING_DIGEST: ${{ steps.existing.outputs.digest }}
+          IMAGE_EXISTS: ${{ steps.existing.outputs.exists }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${IMAGE_EXISTS}" == "true" ]]; then
+            digest="${EXISTING_DIGEST}"
+          else
+            digest="${BUILT_DIGEST}"
+          fi
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Container build did not produce a valid digest"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
       - name: Verify multi-platform manifest
         shell: bash
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           set -euo pipefail
 
@@ -455,12 +490,45 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: binary-*
-          path: dist
-          merge-multiple: true
-      - name: Generate and verify checksums
+          path: staging
+      - name: Package binaries and generate checksums
         shell: bash
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source-date-epoch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
+
+          targets=(
+            'x86_64-unknown-linux-gnu|rathole'
+            'x86_64-pc-windows-msvc|rathole.exe'
+            'x86_64-apple-darwin|rathole'
+            'aarch64-apple-darwin|rathole'
+            'x86_64-unknown-linux-musl|rathole'
+            'aarch64-unknown-linux-musl|rathole'
+            'arm-unknown-linux-musleabi|rathole'
+            'arm-unknown-linux-musleabihf|rathole'
+            'armv7-unknown-linux-musleabihf|rathole'
+          )
+
+          mkdir -p dist
+          for entry in "${targets[@]}"; do
+            IFS='|' read -r target binary <<< "${entry}"
+            source="staging/binary-${target}/${binary}"
+            if [[ ! -f "${source}" ]]; then
+              echo "::error::Missing binary ${source}"
+              exit 1
+            fi
+
+            archive="rathole-${VERSION}-${target}"
+            install -d -m 0755 "dist/${archive}"
+            install -m 0755 "${source}" "dist/${archive}/${binary}"
+            install -m 0644 LICENSE README.md "dist/${archive}/"
+            tar --sort=name --format=gnu --mtime="@${SOURCE_DATE_EPOCH}" \
+              --owner=0 --group=0 --numeric-owner -cf - -C dist "${archive}" |
+              gzip -n -9 > "dist/${archive}.tar.gz"
+            rm -r "dist/${archive}"
+          done
 
           cd dist
           mapfile -t archives < <(find . -maxdepth 1 -type f -name 'rathole-*.tar.gz' -printf '%f\n' | sort)
@@ -529,7 +597,25 @@ jobs:
               gh release create "${RELEASE_TAG}" --verify-tag --latest --generate-notes --title "${RELEASE_TAG}" --notes-file RELEASE_NOTES.md
             fi
           fi
-          gh release upload "${RELEASE_TAG}" dist/* --clobber
+
+          remote_assets="$(gh release view "${RELEASE_TAG}" --json assets)"
+          compare_dir="$(mktemp -d)"
+          mapfile -t local_assets < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+          missing_assets=()
+          for asset in "${local_assets[@]}"; do
+            if jq -e --arg asset "${asset}" 'any(.assets[]; .name == $asset)' <<< "${remote_assets}" >/dev/null; then
+              gh release download "${RELEASE_TAG}" --pattern "${asset}" --dir "${compare_dir}"
+              if ! cmp -s "dist/${asset}" "${compare_dir}/${asset}"; then
+                echo "::error::Release asset ${asset} already exists with different contents"
+                exit 1
+              fi
+            else
+              missing_assets+=("dist/${asset}")
+            fi
+          done
+          if [[ "${#missing_assets[@]}" -gt 0 ]]; then
+            gh release upload "${RELEASE_TAG}" "${missing_assets[@]}"
+          fi
       - name: Remove stale release assets
         shell: bash
         env:

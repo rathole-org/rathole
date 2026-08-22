@@ -1,6 +1,6 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
-use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
+use crate::constants::{listen_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE};
 use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
@@ -12,12 +12,16 @@ use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
+use bytes::Bytes;
 
 use rand::RngCore;
-use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
@@ -34,7 +38,6 @@ type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 
 const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
-const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
@@ -414,9 +417,10 @@ where
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
 
         // Cache some data channels for later use
+        let udp_data_channels = service.udp_data_channels.unwrap_or(1);
         let pool_size = match service.service_type {
             ServiceType::Tcp => TCP_POOL_SIZE,
-            ServiceType::Udp => UDP_POOL_SIZE,
+            ServiceType::Udp => udp_data_channels,
         };
 
         for _i in 0..pool_size {
@@ -451,9 +455,10 @@ where
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
+                        udp_data_channels,
                     )
                     .await
-                    .with_context(|| "Failed to run TCP connection pool")
+                    .with_context(|| "Failed to run UDP connection pool")
                     {
                         error!("{:#}", e);
                     }
@@ -660,47 +665,83 @@ async fn run_tcp_connection_pool<T: Transport>(
 async fn run_udp_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    num_channels: usize,
 ) -> Result<()> {
-    // TODO: Load balance
-
-    let l = retry_notify_with_deadline(
-        listen_backoff(),
-        || async { Ok(UdpSocket::bind(&bind_addr).await?) },
-        |e, duration| {
-            warn!("{:#}. Retry in {:?}", e, duration);
-        },
-        &mut shutdown_rx,
-    )
-    .await
-    .with_context(|| "Failed to listen for the service")?;
+    let l: Arc<UdpSocket> = Arc::new(
+        retry_notify_with_deadline(
+            listen_backoff(),
+            || async { Ok(UdpSocket::bind(&bind_addr).await?) },
+            |e, duration| {
+                warn!("{:#}. Retry in {:?}", e, duration);
+            },
+            &mut shutdown_rx,
+        )
+        .await
+        .with_context(|| "Failed to listen for the service")?,
+    );
 
     info!("Listening at {}", &bind_addr);
 
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
 
-    // Receive one data channel
-    let mut conn = data_ch_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow!("No available data channels"))?;
-    write_and_flush(&mut conn, &cmd).await?;
+    let mut slots: Vec<Option<mpsc::Sender<UdpTraffic>>> =
+        (0..num_channels).map(|_| None).collect();
+    let mut vacant: VecDeque<usize> = (0..num_channels).collect();
+
+    let (broken_tx, mut broken_rx) = mpsc::unbounded_channel::<usize>();
 
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {
         tokio::select! {
+            val = data_ch_rx.recv(), if !vacant.is_empty() => {
+                match val {
+                    Some(mut conn) => {
+                        if write_and_flush(&mut conn, &cmd).await.is_ok() {
+                            let i = vacant.pop_front().unwrap();
+                            let (tx, rx) = mpsc::channel(UDP_SENDQ_SIZE);
+                            slots[i] = Some(tx);
+
+                            let socket = l.clone();
+                            let broken_tx = broken_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = run_udp_data_channel(conn, socket, rx).await {
+                                    debug!("Data channel for slot {} closed: {:#}", i, e);
+                                }
+                                let _ = broken_tx.send(i);
+                            }.instrument(Span::current()));
+                        } else if data_ch_req_tx.send(true).is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            },
+
             // Forward inbound traffic to the client
             val = l.recv_from(&mut buf) => {
                 let (n, from) = val?;
-                UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
+                if let Some(tx) = &slots[slot_index(&from, num_channels)] {
+                    let t = UdpTraffic {
+                        from,
+                        data: Bytes::copy_from_slice(&buf[..n]),
+                    };
+                    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(t) {
+                        debug!("UDP send queue of the data channel is full. Dropping the packet from {}", from);
+                    }
+                }
             },
 
-            // Forward outbound traffic from the client to the visitor
-            hdr_len = conn.read_u8() => {
-                let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
-                l.send_to(&t.data, t.from).await?;
-            }
+            val = broken_rx.recv() => {
+                if let Some(i) = val {
+                    slots[i] = None;
+                    vacant.push_back(i);
+                    if data_ch_req_tx.send(true).is_err() {
+                        break;
+                    }
+                }
+            },
 
             _ = shutdown_rx.recv() => {
                 break;
@@ -709,6 +750,38 @@ async fn run_udp_connection_pool<T: Transport>(
     }
 
     debug!("UDP pool dropped");
+
+    Ok(())
+}
+
+fn slot_index(from: &SocketAddr, num_channels: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    from.hash(&mut hasher);
+    (hasher.finish() % num_channels as u64) as usize
+}
+
+async fn run_udp_data_channel<Stream: AsyncRead + AsyncWrite + Unpin>(
+    mut conn: Stream,
+    socket: Arc<UdpSocket>,
+    mut outbound_rx: mpsc::Receiver<UdpTraffic>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            // Forward inbound traffic to the client
+            t = outbound_rx.recv() => {
+                match t {
+                    Some(t) => t.write(&mut conn).await?,
+                    None => break,
+                }
+            },
+
+            // Forward outbound traffic from the client to the visitor
+            hdr_len = conn.read_u8() => {
+                let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
+                socket.send_to(&t.data, t.from).await?;
+            }
+        }
+    }
 
     Ok(())
 }

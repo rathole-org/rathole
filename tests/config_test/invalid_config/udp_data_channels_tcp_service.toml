@@ -1,0 +1,8 @@
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "123"
+
+[server.services.foo]
+type = "tcp"
+bind_addr = "0.0.0.0:5202"
+udp_data_channels = 2

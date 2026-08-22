@@ -609,13 +609,14 @@ jobs:
           } > RELEASE_NOTES.md
 
           title="Dev build (${GITHUB_SHA::7})"
-          if [[ "${release_exists}" != "true" ]]; then
-            gh release create "${RELEASE_TAG}" --draft --prerelease --target "${GITHUB_SHA}" --title "${title}" --notes-file RELEASE_NOTES.md
-          fi
-
           git tag --force "${RELEASE_TAG}" "${GITHUB_SHA}"
           git push --force origin "refs/tags/${RELEASE_TAG}"
-          gh release edit "${RELEASE_TAG}" --draft --verify-tag --prerelease --target "${GITHUB_SHA}" --title "${title}" --notes-file RELEASE_NOTES.md
+
+          if [[ "${release_exists}" != "true" ]]; then
+            gh release create "${RELEASE_TAG}" --draft --prerelease --verify-tag --title "${title}" --notes-file RELEASE_NOTES.md
+          fi
+
+          gh release edit "${RELEASE_TAG}" --draft --prerelease --title "${title}" --notes-file RELEASE_NOTES.md
           gh release upload "${RELEASE_TAG}" dist/* --clobber
       - name: Stage tagged release
         if: needs.prepare.outputs.channel != 'dev'

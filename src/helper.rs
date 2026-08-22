@@ -110,6 +110,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
 pub async fn tcp_connect_with_proxy(
     addr: &AddrMaybeCached,
     proxy: Option<&Url>,
+    fast_open: bool,
 ) -> Result<TcpStream> {
     if let Some(url) = proxy {
         let addr = &addr.addr;
@@ -151,11 +152,77 @@ pub async fn tcp_connect_with_proxy(
         }
         Ok(s)
     } else {
+        #[cfg(target_os = "linux")]
+        if fast_open {
+            let socket_addr = match addr.socket_addr {
+                Some(s) => s,
+                None => to_socket_addr(&addr.addr).await?,
+            };
+            return tcp_connect_fast_open(socket_addr).await;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = fast_open;
+        }
+
         Ok(match addr.socket_addr {
             Some(s) => TcpStream::connect(s).await?,
             None => TcpStream::connect(&addr.addr).await?,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn set_tcp_fastopen(
+    fd: std::os::unix::io::RawFd,
+    optname: libc::c_int,
+    value: libc::c_int,
+) -> Result<()> {
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            optname,
+            &value as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Create a TCP listener with `TCP_FASTOPEN` enabled. Linux only.
+#[cfg(target_os = "linux")]
+pub async fn tcp_bind_fast_open(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    use std::os::unix::io::AsRawFd;
+
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    set_tcp_fastopen(socket.as_raw_fd(), libc::TCP_FASTOPEN, 1024)
+        .with_context(|| "Failed to set TCP_FASTOPEN")?;
+    Ok(socket.listen(1024)?)
+}
+
+/// Connect a TCP socket with `TCP_FASTOPEN_CONNECT` enabled. Linux only.
+#[cfg(target_os = "linux")]
+pub async fn tcp_connect_fast_open(addr: SocketAddr) -> Result<TcpStream> {
+    use std::os::unix::io::AsRawFd;
+
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    set_tcp_fastopen(socket.as_raw_fd(), libc::TCP_FASTOPEN_CONNECT, 1)
+        .with_context(|| "Failed to set TCP_FASTOPEN_CONNECT")?;
+    Ok(socket.connect(addr).await?)
 }
 
 // Wrapper of retry_notify

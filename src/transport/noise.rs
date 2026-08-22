@@ -75,7 +75,7 @@ impl Transport for NoiseTransport {
     }
 
     async fn bind<T: ToSocketAddrs + Send + Sync>(&self, addr: T) -> Result<Self::Acceptor> {
-        Ok(TcpListener::bind(addr).await?)
+        self.tcp.bind(addr).await
     }
 
     async fn accept(&self, a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)> {

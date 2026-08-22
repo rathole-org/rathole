@@ -14,6 +14,8 @@ pub const DEFAULT_NODELAY: bool = true;
 pub const DEFAULT_KEEPALIVE_SECS: u64 = 20;
 pub const DEFAULT_KEEPALIVE_INTERVAL: u64 = 8;
 
+pub const DEFAULT_FAST_OPEN: bool = false;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportRole {
     Client,

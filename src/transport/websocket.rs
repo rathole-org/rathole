@@ -209,7 +209,10 @@ impl Transport for WebsocketTransport {
         &self,
         addr: A,
     ) -> anyhow::Result<Self::Acceptor> {
-        TcpListener::bind(addr).await.map_err(Into::into)
+        match &self.sub {
+            SubTransport::Insecure(t) => t.bind(addr).await,
+            SubTransport::Secure(t) => t.bind(addr).await,
+        }
     }
 
     async fn accept(&self, a: &Self::Acceptor) -> anyhow::Result<(Self::RawStream, SocketAddr)> {

@@ -2,6 +2,8 @@ use crate::{
     config::{TcpConfig, TransportConfig},
     helper::tcp_connect_with_proxy,
 };
+#[cfg(target_os = "linux")]
+use crate::helper::{tcp_bind_fast_open, to_socket_addr};
 
 use super::{AddrMaybeCached, SocketOpts, Transport, TransportRole};
 use anyhow::Result;
@@ -33,6 +35,11 @@ impl Transport for TcpTransport {
     }
 
     async fn bind<T: ToSocketAddrs + Send + Sync>(&self, addr: T) -> Result<Self::Acceptor> {
+        #[cfg(target_os = "linux")]
+        if self.cfg.fast_open {
+            let socket_addr = to_socket_addr(addr).await?;
+            return tcp_bind_fast_open(socket_addr).await;
+        }
         Ok(TcpListener::bind(addr).await?)
     }
 
@@ -47,7 +54,7 @@ impl Transport for TcpTransport {
     }
 
     async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream> {
-        let s = tcp_connect_with_proxy(addr, self.cfg.proxy.as_ref()).await?;
+        let s = tcp_connect_with_proxy(addr, self.cfg.proxy.as_ref(), self.cfg.fast_open).await?;
         self.socket_opts.apply(&s);
         Ok(s)
     }

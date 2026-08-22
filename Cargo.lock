@@ -2321,6 +2321,7 @@ dependencies = [
  "futures-sink",
  "hex",
  "lazy_static",
+ "libc",
  "notify",
  "openssl",
  "p12",

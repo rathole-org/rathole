@@ -8,7 +8,9 @@ use std::path::Path;
 use tokio::fs;
 use url::Url;
 
-use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
+use crate::transport::{
+    DEFAULT_FAST_OPEN, DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY,
+};
 
 /// Application-layer heartbeat interval in secs
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
@@ -195,6 +197,10 @@ fn default_keepalive_interval() -> u64 {
     DEFAULT_KEEPALIVE_INTERVAL
 }
 
+fn default_fast_open() -> bool {
+    DEFAULT_FAST_OPEN
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TcpConfig {
@@ -204,6 +210,8 @@ pub struct TcpConfig {
     pub keepalive_secs: u64,
     #[serde(default = "default_keepalive_interval")]
     pub keepalive_interval: u64,
+    #[serde(default = "default_fast_open")]
+    pub fast_open: bool,
     pub proxy: Option<Url>,
 }
 
@@ -213,6 +221,7 @@ impl Default for TcpConfig {
             nodelay: default_nodelay(),
             keepalive_secs: default_keepalive_secs(),
             keepalive_interval: default_keepalive_interval(),
+            fast_open: default_fast_open(),
             proxy: None,
         }
     }
@@ -342,6 +351,12 @@ impl Config {
                 "http" => Ok(()),
                 _ => Err(anyhow!(format!("Unknown proxy scheme: {}", u.scheme()))),
             })?;
+
+        #[cfg(not(target_os = "linux"))]
+        if config.tcp.fast_open {
+            return Err(anyhow!("`tcp.fast_open` is only supported on Linux"));
+        }
+
         match config.transport_type {
             TransportType::Tcp => Ok(()),
             TransportType::Tls => Config::validate_tls_config(config, is_server),

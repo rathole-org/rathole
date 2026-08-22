@@ -144,10 +144,10 @@ impl Transport for TlsTransport {
     }
 
     async fn bind<A: ToSocketAddrs + Send + Sync>(&self, addr: A) -> Result<Self::Acceptor> {
-        let l = TcpListener::bind(addr)
+        self.tcp
+            .bind(addr)
             .await
-            .with_context(|| "Failed to create tcp listener")?;
-        Ok(l)
+            .with_context(|| "Failed to create tcp listener")
     }
 
     async fn accept(&self, a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)> {

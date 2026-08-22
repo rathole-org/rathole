@@ -15,7 +15,7 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
@@ -268,7 +268,7 @@ type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
 async fn run_data_channel_for_udp<T: Transport>(
-    conn: T::Stream,
+    mut conn: T::Stream,
     local_addr: &str,
     prefer_ipv6: bool,
 ) -> Result<()> {
@@ -279,72 +279,74 @@ async fn run_data_channel_for_udp<T: Transport>(
     // The channel stores UdpTraffic that needs to be sent to the server
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<UdpTraffic>(UDP_SENDQ_SIZE);
 
-    // FIXME: https://github.com/tokio-rs/tls/issues/40
-    // Maybe this is our concern
-    let (mut rd, mut wr) = io::split(conn);
-
-    // Keep sending items from the outbound channel to the server
-    tokio::spawn(async move {
-        while let Some(t) = outbound_rx.recv().await {
-            trace!("outbound {:?}", t);
-            if let Err(e) = t
-                .write(&mut wr)
-                .await
-                .with_context(|| "Failed to forward UDP traffic to the server")
-            {
-                debug!("{:?}", e);
-                break;
-            }
-        }
-    });
-
+    // Read from and write to `conn` from a single task, alternating via `select!`,
+    // instead of splitting it and using it from two tasks concurrently.
+    // TLS streams aren't guaranteed to be full-duplex safe for concurrent
+    // reads/writes from independent tasks: https://github.com/tokio-rs/tls/issues/40
     loop {
-        // Read a packet from the server
-        let hdr_len = rd.read_u8().await?;
-        let packet = UdpTraffic::read(&mut rd, hdr_len)
-            .await
-            .with_context(|| "Failed to read UDPTraffic from the server")?;
-        let m = port_map.read().await;
-
-        if m.get(&packet.from).is_none() {
-            // This packet is from a address we don't see for a while,
-            // which is not in the UdpPortMap.
-            // So set up a mapping (and a forwarder) for it
-
-            // Drop the reader lock
-            drop(m);
-
-            // Grab the writer lock
-            // This is the only thread that will try to grab the writer lock
-            // So no need to worry about some other thread has already set up
-            // the mapping between the gap of dropping the reader lock and
-            // grabbing the writer lock
-            let mut m = port_map.write().await;
-
-            match udp_connect(local_addr, prefer_ipv6).await {
-                Ok(s) => {
-                    let (inbound_tx, inbound_rx) = mpsc::channel(UDP_SENDQ_SIZE);
-                    m.insert(packet.from, inbound_tx);
-                    tokio::spawn(run_udp_forwarder(
-                        s,
-                        inbound_rx,
-                        outbound_tx.clone(),
-                        packet.from,
-                        port_map.clone(),
-                    ));
-                }
-                Err(e) => {
-                    error!("{:#}", e);
+        tokio::select! {
+            t = outbound_rx.recv() => {
+                match t {
+                    Some(t) => {
+                        trace!("outbound {:?}", t);
+                        t.write(&mut conn)
+                            .await
+                            .with_context(|| "Failed to forward UDP traffic to the server")?;
+                    }
+                    None => break,
                 }
             }
-        }
 
-        // Now there should be a udp forwarder that can receive the packet
-        let m = port_map.read().await;
-        if let Some(tx) = m.get(&packet.from) {
-            let _ = tx.send(packet.data).await;
+            hdr_len = conn.read_u8() => {
+                // Read a packet from the server
+                let packet = UdpTraffic::read(&mut conn, hdr_len?)
+                    .await
+                    .with_context(|| "Failed to read UDPTraffic from the server")?;
+                let m = port_map.read().await;
+
+                if m.get(&packet.from).is_none() {
+                    // This packet is from a address we don't see for a while,
+                    // which is not in the UdpPortMap.
+                    // So set up a mapping (and a forwarder) for it
+
+                    // Drop the reader lock
+                    drop(m);
+
+                    // Grab the writer lock
+                    // This is the only thread that will try to grab the writer lock
+                    // So no need to worry about some other thread has already set up
+                    // the mapping between the gap of dropping the reader lock and
+                    // grabbing the writer lock
+                    let mut m = port_map.write().await;
+
+                    match udp_connect(local_addr, prefer_ipv6).await {
+                        Ok(s) => {
+                            let (inbound_tx, inbound_rx) = mpsc::channel(UDP_SENDQ_SIZE);
+                            m.insert(packet.from, inbound_tx);
+                            tokio::spawn(run_udp_forwarder(
+                                s,
+                                inbound_rx,
+                                outbound_tx.clone(),
+                                packet.from,
+                                port_map.clone(),
+                            ));
+                        }
+                        Err(e) => {
+                            error!("{:#}", e);
+                        }
+                    }
+                }
+
+                // Now there should be a udp forwarder that can receive the packet
+                let m = port_map.read().await;
+                if let Some(tx) = m.get(&packet.from) {
+                    let _ = tx.send(packet.data).await;
+                }
+            }
         }
     }
+
+    Ok(())
 }
 
 #[cfg(unix)]

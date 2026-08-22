@@ -16,8 +16,11 @@ use cli::KeypairType;
 pub use config::Config;
 pub use constants::UDP_BUFFER_SIZE;
 
-use anyhow::Result;
-use tokio::sync::{broadcast, mpsc};
+use anyhow::{anyhow, Context, Result};
+use tokio::{
+    sync::{broadcast, mpsc},
+    task::{JoinError, JoinSet},
+};
 use tracing::{debug, info};
 
 #[cfg(feature = "client")]
@@ -78,44 +81,98 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     // shutdown_tx owns the instance
     let (shutdown_tx, _) = broadcast::channel(1);
 
-    // (The join handle of the last instance, The service update channel sender)
-    let mut last_instance: Option<(tokio::task::JoinHandle<_>, mpsc::Sender<ConfigChange>)> = None;
+    // Exactly one instance can be active. JoinSet lets the outer loop observe
+    // an instance failure without waiting for another configuration event.
+    let mut instance_tasks = JoinSet::new();
+    let mut service_update_tx = None;
 
-    while let Some(e) = cfg_watcher.event_rx.recv().await {
-        match e {
-            ConfigChange::General(config) => {
-                if let Some((i, _)) = last_instance {
-                    info!("General configuration change detected. Restarting...");
-                    shutdown_tx.send(true)?;
-                    i.await??;
+    loop {
+        tokio::select! {
+            event = cfg_watcher.event_rx.recv() => {
+                match event {
+                    Some(ConfigChange::General(config)) => {
+                        if !instance_tasks.is_empty() {
+                            info!("General configuration change detected. Restarting...");
+                            stop_active_instance(&shutdown_tx, &mut instance_tasks).await?;
+                        }
+
+                        debug!("{:?}", config);
+
+                        let (update_tx, update_rx) = mpsc::channel(1024);
+                        instance_tasks.spawn(run_instance(
+                            *config,
+                            args.clone(),
+                            shutdown_tx.subscribe(),
+                            update_rx,
+                        ));
+                        service_update_tx = Some(update_tx);
+                    }
+                    Some(event) => {
+                        info!("Service change detected. {:?}", event);
+                        if let Some(update_tx) = &service_update_tx {
+                            let _ = update_tx.send(event).await;
+                        }
+                    }
+                    None => {
+                        let watcher_result = cfg_watcher.wait().await;
+                        let instance_result =
+                            stop_active_instance(&shutdown_tx, &mut instance_tasks).await;
+                        return finish_shutdown(watcher_result, instance_result);
+                    }
                 }
-
-                debug!("{:?}", config);
-
-                let (service_update_tx, service_update_rx) = mpsc::channel(1024);
-
-                last_instance = Some((
-                    tokio::spawn(run_instance(
-                        *config,
-                        args.clone(),
-                        shutdown_tx.subscribe(),
-                        service_update_rx,
-                    )),
-                    service_update_tx,
-                ));
             }
-            ev => {
-                info!("Service change detected. {:?}", ev);
-                if let Some((_, service_update_tx)) = &last_instance {
-                    let _ = service_update_tx.send(ev).await;
-                }
+            instance_result = instance_tasks.join_next(), if !instance_tasks.is_empty() => {
+                return unexpected_instance_exit(
+                    instance_result.ok_or_else(|| anyhow!("active instance task disappeared"))?,
+                );
             }
         }
     }
+}
 
-    let _ = shutdown_tx.send(true);
+fn finish_shutdown(watcher_result: Result<()>, instance_result: Result<()>) -> Result<()> {
+    match (watcher_result, instance_result) {
+        (Ok(()), result) => result,
+        (Err(watcher_error), Ok(())) => Err(watcher_error).context("configuration watcher failed"),
+        (Err(watcher_error), Err(instance_error)) => Err(instance_error).context(format!(
+            "configuration watcher also failed: {watcher_error:#}"
+        )),
+    }
+}
 
-    Ok(())
+async fn stop_active_instance(
+    shutdown_tx: &broadcast::Sender<bool>,
+    instance_tasks: &mut JoinSet<Result<()>>,
+) -> Result<()> {
+    if instance_tasks.is_empty() {
+        return Ok(());
+    }
+
+    // A failed instance may already have dropped its receiver. Awaiting the
+    // task below preserves that failure instead of returning "channel closed".
+    let shutdown_sent = shutdown_tx.send(true).is_ok();
+    let instance_result = instance_tasks
+        .join_next()
+        .await
+        .ok_or_else(|| anyhow!("active instance task disappeared while shutting down"))?
+        .context("active instance task panicked")?;
+
+    match instance_result {
+        Ok(()) if shutdown_sent => Ok(()),
+        Ok(()) => Err(anyhow!(
+            "active instance exited before receiving the shutdown signal"
+        )),
+        Err(error) => Err(error).context("active instance failed while shutting down"),
+    }
+}
+
+fn unexpected_instance_exit(
+    instance_result: std::result::Result<Result<()>, JoinError>,
+) -> Result<()> {
+    match instance_result.context("active instance task panicked")? {
+        Ok(()) => Err(anyhow!("active instance exited unexpectedly")),
+        Err(error) => Err(error).context("active instance exited unexpectedly"),
+    }
 }
 
 async fn run_instance(
@@ -168,6 +225,35 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "server")]
+    fn server_args(bind_addr: std::net::SocketAddr) -> (tempfile::TempDir, Cli) {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("server.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[server]
+bind_addr = "{bind_addr}"
+
+[server.transport]
+type = "tcp"
+
+[server.services.test]
+bind_addr = "127.0.0.1:0"
+token = "test-token"
+"#,
+            ),
+        )
+        .unwrap();
+
+        let args = Cli {
+            config_path: Some(config_path),
+            server: true,
+            ..Default::default()
+        };
+        (config_dir, args)
+    }
 
     #[test]
     fn test_determine_run_mode() {
@@ -255,5 +341,148 @@ mod tests {
 
             assert_eq!(determine_run_mode(&config, &args), t.run_mode);
         }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn run_surfaces_instance_startup_failure() {
+        use std::time::Duration;
+        use tokio::{net::TcpListener, time};
+
+        let occupied_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_addr = occupied_listener.local_addr().unwrap();
+        let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let (_config_dir, args) = server_args(occupied_addr);
+
+        let result = time::timeout(Duration::from_secs(5), run(args, shutdown_rx))
+            .await
+            .expect("startup failure should be reported promptly");
+        let error = format!(
+            "{:#}",
+            result.expect_err("an occupied listener must fail startup")
+        );
+        assert!(
+            error.contains("active instance exited unexpectedly"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Failed to listen at `server.bind_addr`"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn run_releases_listener_before_shutdown_returns() {
+        use std::time::Duration;
+        use tokio::{net::TcpListener, net::TcpStream, time};
+
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind_addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let (_config_dir, args) = server_args(bind_addr);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let run_task = tokio::spawn(run(args, shutdown_rx));
+
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(stream) = TcpStream::connect(bind_addr).await {
+                    drop(stream);
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("server listener should start promptly");
+
+        shutdown_tx.send(true).unwrap();
+        time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("shutdown should complete promptly")
+            .expect("rathole task should not panic")
+            .expect("rathole should shut down cleanly");
+
+        TcpListener::bind(bind_addr)
+            .await
+            .expect("listener must be released before shutdown returns");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_the_active_instance() {
+        use std::time::Duration;
+        use tokio::{sync::oneshot, time};
+
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let mut instance_tasks = JoinSet::new();
+        instance_tasks.spawn(async move {
+            shutdown_rx.recv().await.unwrap();
+            finish_rx.await.unwrap();
+            Ok(())
+        });
+
+        let mut stopping = Box::pin(stop_active_instance(&shutdown_tx, &mut instance_tasks));
+        assert!(
+            time::timeout(Duration::from_millis(25), &mut stopping)
+                .await
+                .is_err(),
+            "shutdown returned before the active instance finished"
+        );
+
+        finish_tx.send(()).unwrap();
+        time::timeout(Duration::from_secs(1), stopping)
+            .await
+            .expect("shutdown should finish promptly after the instance exits")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_overlap_instances() {
+        use std::time::Duration;
+        use tokio::{sync::oneshot, time};
+
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let (replacement_started_tx, mut replacement_started_rx) = oneshot::channel();
+        let mut instance_tasks = JoinSet::new();
+        instance_tasks.spawn(async move {
+            shutdown_rx.recv().await.unwrap();
+            finish_rx.await.unwrap();
+            Ok(())
+        });
+
+        let mut restarting = Box::pin(async {
+            stop_active_instance(&shutdown_tx, &mut instance_tasks).await?;
+            instance_tasks.spawn(async move {
+                replacement_started_tx.send(()).unwrap();
+                Ok(())
+            });
+            Result::<()>::Ok(())
+        });
+
+        assert!(
+            time::timeout(Duration::from_millis(25), &mut restarting)
+                .await
+                .is_err(),
+            "restart completed before the old instance finished"
+        );
+        assert!(
+            matches!(
+                replacement_started_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "replacement started while the old instance was active"
+        );
+
+        finish_tx.send(()).unwrap();
+        time::timeout(Duration::from_secs(1), restarting)
+            .await
+            .expect("restart should continue after the old instance exits")
+            .unwrap();
+        replacement_started_rx
+            .await
+            .expect("replacement instance should start");
     }
 }

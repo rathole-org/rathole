@@ -26,9 +26,11 @@ Configure an environment named `release` in **Settings > Environments**:
 - deployment tags restricted to `v*`; and
 - `CRATES_IO_API_TOKEN` stored as an environment secret.
 
-The workflow grants `contents: write` and `packages: write` only to the
-protected versioned publisher. The pre-approval container job has
-`packages: write` solely to push an untagged digest for runtime verification.
+For the versioned path, the workflow grants `contents: write` only to the
+protected publisher. The pre-approval container job has `packages: write`
+solely to push an untagged digest for runtime verification; only the protected
+publisher creates named version aliases. The separate `dev` release job keeps
+its existing `contents: write` permission and cannot run for a release event.
 
 ## Request a release
 
@@ -93,4 +95,3 @@ are reused on a retry; conflicting crate source or release assets fail closed.
   destination checks make an identical partial publication safe to resume.
 - Never use the rolling `dev-latest` draft as a versioned release request. It is
   maintained automatically by pushes to `dev`.
-

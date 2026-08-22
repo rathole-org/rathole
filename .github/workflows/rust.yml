@@ -29,7 +29,9 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
       - name: Setup cargo-hack
-        run: cargo install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
       - name: Check all features
         run: >
           cargo hack check --feature-powerset --no-dev-deps

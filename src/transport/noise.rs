@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use super::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
+use super::{AddrMaybeCached, SocketOpts, TcpTransport, Transport, TransportRole};
 use crate::config::{NoiseConfig, TransportConfig};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -37,8 +37,8 @@ impl Transport for NoiseTransport {
     type RawStream = TcpStream;
     type Stream = snowstorm::stream::NoiseStream<TcpStream>;
 
-    fn new(config: &TransportConfig) -> Result<Self> {
-        let tcp = TcpTransport::new(config)?;
+    fn new(config: &TransportConfig, role: TransportRole) -> Result<Self> {
+        let tcp = TcpTransport::new(config, role)?;
 
         let config = match &config.noise {
             Some(v) => v.clone(),

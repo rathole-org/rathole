@@ -344,26 +344,40 @@ impl Config {
             })?;
         match config.transport_type {
             TransportType::Tcp => Ok(()),
-            TransportType::Tls => {
-                let tls_config = config
-                    .tls
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Missing TLS configuration"))?;
-                if is_server {
-                    tls_config
-                        .pkcs12
-                        .as_ref()
-                        .and(tls_config.pkcs12_password.as_ref())
-                        .ok_or_else(|| anyhow!("Missing `pkcs12` or `pkcs12_password`"))?;
-                }
-                Ok(())
-            }
+            TransportType::Tls => Config::validate_tls_config(config, is_server),
             TransportType::Noise => {
                 // The check is done in transport
                 Ok(())
             }
-            TransportType::Websocket => Ok(()),
+            TransportType::Websocket => {
+                let websocket_config = config
+                    .websocket
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Missing WebSocket configuration"))?;
+                if websocket_config.tls {
+                    Config::validate_tls_config(config, is_server)?;
+                }
+                Ok(())
+            }
         }
+    }
+
+    fn validate_tls_config(config: &TransportConfig, is_server: bool) -> Result<()> {
+        let tls_config = config
+            .tls
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing TLS configuration"))?;
+        if is_server {
+            tls_config
+                .pkcs12
+                .as_ref()
+                .ok_or_else(|| anyhow!("Missing `tls.pkcs12`"))?;
+            tls_config
+                .pkcs12_password
+                .as_ref()
+                .ok_or_else(|| anyhow!("Missing `tls.pkcs12_password`"))?;
+        }
+        Ok(())
     }
 
     pub async fn from_file(path: &Path) -> Result<Config> {
@@ -432,6 +446,50 @@ mod tests {
             assert!(Config::from_str(&s).is_err());
         }
         Ok(())
+    }
+
+    fn websocket_transport(tls: bool, tls_config: Option<TlsConfig>) -> TransportConfig {
+        TransportConfig {
+            transport_type: TransportType::Websocket,
+            tls: tls_config,
+            websocket: Some(WebsocketConfig { tls }),
+            ..Default::default()
+        }
+    }
+
+    fn server_tls_config(pkcs12: Option<&str>, pkcs12_password: Option<&str>) -> TlsConfig {
+        TlsConfig {
+            hostname: None,
+            trusted_root: None,
+            pkcs12: pkcs12.map(str::to_owned),
+            pkcs12_password: pkcs12_password.map(MaskedString::from),
+        }
+    }
+
+    #[test]
+    fn secure_websocket_requires_role_appropriate_tls_config() {
+        let missing_tls = websocket_transport(true, None);
+        assert!(Config::validate_transport_config(&missing_tls, false).is_err());
+        assert!(Config::validate_transport_config(&missing_tls, true).is_err());
+
+        let missing_identity =
+            websocket_transport(true, Some(server_tls_config(None, Some("password"))));
+        let error = Config::validate_transport_config(&missing_identity, true)
+            .expect_err("secure WebSocket server must have an identity");
+        assert!(error.to_string().contains("tls.pkcs12"));
+
+        let missing_password =
+            websocket_transport(true, Some(server_tls_config(Some("identity.p12"), None)));
+        let error = Config::validate_transport_config(&missing_password, true)
+            .expect_err("secure WebSocket server must have an identity password");
+        assert!(error.to_string().contains("tls.pkcs12_password"));
+
+        let client_system_roots = websocket_transport(true, Some(server_tls_config(None, None)));
+        assert!(Config::validate_transport_config(&client_system_roots, false).is_ok());
+
+        let insecure = websocket_transport(false, None);
+        assert!(Config::validate_transport_config(&insecure, false).is_ok());
+        assert!(Config::validate_transport_config(&insecure, true).is_ok());
     }
 
     #[test]

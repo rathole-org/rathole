@@ -1,6 +1,6 @@
 use crate::config::{TlsConfig, TransportConfig};
 use crate::helper::host_port_pair;
-use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
+use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport, TransportRole};
 use std::fmt::Debug;
 use std::fs;
 use std::net::SocketAddr;
@@ -20,8 +20,12 @@ use p12::PFX;
 pub struct TlsTransport {
     tcp: TcpTransport,
     config: TlsConfig,
-    connector: Option<TlsConnector>,
-    tls_acceptor: Option<TlsAcceptor>,
+    endpoint: TlsEndpoint,
+}
+
+enum TlsEndpoint {
+    Client(TlsConnector),
+    Server(TlsAcceptor),
 }
 
 // workaround for TlsConnector and TlsAcceptor not implementing Debug
@@ -34,36 +38,31 @@ impl Debug for TlsTransport {
     }
 }
 
-fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
-    if let Some(pkcs12_path) = config.pkcs12.as_ref() {
-        let pass = config
-            .pkcs12_password
-            .as_ref()
-            .context("Missing `tls.pkcs12_password`")?;
-        let buf = fs::read(pkcs12_path)?;
-        let pfx = PFX::parse(buf.as_slice())?;
+fn load_server_config(config: &TlsConfig) -> Result<ServerConfig> {
+    let pkcs12_path = config.pkcs12.as_ref().context("Missing `tls.pkcs12`")?;
+    let pass = config
+        .pkcs12_password
+        .as_ref()
+        .context("Missing `tls.pkcs12_password`")?;
+    let buf = fs::read(pkcs12_path).context("Failed to read `tls.pkcs12`")?;
+    let pfx = PFX::parse(buf.as_slice())?;
 
-        let certs = pfx.cert_bags(pass)?;
-        let keys = pfx.key_bags(pass)?;
+    let certs = pfx.cert_bags(pass)?;
+    let keys = pfx.key_bags(pass)?;
 
-        let chain: Vec<CertificateDer> = certs.into_iter().map(CertificateDer::from).collect();
-        let key = keys
-            .into_iter()
-            .next()
-            .map(PrivatePkcs8KeyDer::from)
-            .context("PKCS#12 identity contains no private key")?;
+    let chain: Vec<CertificateDer> = certs.into_iter().map(CertificateDer::from).collect();
+    let key = keys
+        .into_iter()
+        .next()
+        .map(PrivatePkcs8KeyDer::from)
+        .context("PKCS#12 identity contains no private key")?;
 
-        Ok(Some(
-            ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(chain, key.into())?,
-        ))
-    } else {
-        Ok(None)
-    }
+    Ok(ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key.into())?)
 }
 
-fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
+fn load_client_config(config: &TlsConfig) -> Result<ClientConfig> {
     let mut root_certs = RootCertStore::empty();
 
     if let Some(path) = config.trusted_root.as_deref() {
@@ -97,8 +96,7 @@ fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
         }
 
         if native.certs.is_empty() {
-            // allow missing client root_certs (old behaviour)
-            return Ok(None);
+            anyhow::bail!("No trusted root certificates found in the system certificate store");
         }
 
         for cert in native.certs {
@@ -107,11 +105,9 @@ fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
         }
     }
 
-    Ok(Some(
-        ClientConfig::builder()
-            .with_root_certificates(root_certs)
-            .with_no_client_auth(),
-    ))
+    Ok(ClientConfig::builder()
+        .with_root_certificates(root_certs)
+        .with_no_client_auth())
 }
 
 #[async_trait]
@@ -120,21 +116,26 @@ impl Transport for TlsTransport {
     type RawStream = TcpStream;
     type Stream = TlsStream<TcpStream>;
 
-    fn new(config: &TransportConfig) -> Result<Self> {
-        let tcp = TcpTransport::new(config)?;
+    fn new(config: &TransportConfig, role: TransportRole) -> Result<Self> {
+        let tcp = TcpTransport::new(config, role)?;
         let config = config
             .tls
             .as_ref()
             .ok_or_else(|| anyhow!("Missing tls config"))?;
 
-        let connector = load_client_config(config)?.map(|c| Arc::new(c).into());
-        let tls_acceptor = load_server_config(config)?.map(|c| Arc::new(c).into());
+        let endpoint = match role {
+            TransportRole::Client => {
+                TlsEndpoint::Client(Arc::new(load_client_config(config)?).into())
+            }
+            TransportRole::Server => {
+                TlsEndpoint::Server(Arc::new(load_server_config(config)?).into())
+            }
+        };
 
         Ok(TlsTransport {
             tcp,
             config: config.clone(),
-            connector,
-            tls_acceptor,
+            endpoint,
         })
     }
 
@@ -157,14 +158,31 @@ impl Transport for TlsTransport {
     }
 
     async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream> {
-        let conn = self.tls_acceptor.as_ref().unwrap().accept(conn).await?;
+        let acceptor = match &self.endpoint {
+            TlsEndpoint::Server(acceptor) => acceptor,
+            TlsEndpoint::Client(_) => {
+                return Err(anyhow!(
+                    "Client TLS transport cannot perform a server handshake"
+                ));
+            }
+        };
+        let conn = acceptor
+            .accept(conn)
+            .await
+            .context("Failed to accept TLS connection")?;
         Ok(tokio_rustls::TlsStream::Server(conn))
     }
 
     async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream> {
+        let connector = match &self.endpoint {
+            TlsEndpoint::Client(connector) => connector,
+            TlsEndpoint::Server(_) => {
+                return Err(anyhow!(
+                    "Server TLS transport cannot perform a client connection"
+                ));
+            }
+        };
         let conn = self.tcp.connect(addr).await?;
-
-        let connector = self.connector.as_ref().unwrap();
 
         let host_name = self
             .config
@@ -220,7 +238,10 @@ mod tests {
         let trusted_root = tempfile::NamedTempFile::new()?;
         fs::write(trusted_root.path(), b"not a PEM certificate")?;
 
-        let result = TlsTransport::new(&client_transport(trusted_root.path()));
+        let result = TlsTransport::new(
+            &client_transport(trusted_root.path()),
+            TransportRole::Client,
+        );
         assert!(result.is_err());
         Ok(())
     }
@@ -230,7 +251,10 @@ mod tests {
         let identity = tempfile::NamedTempFile::new()?;
         fs::write(identity.path(), b"not a PKCS#12 identity")?;
 
-        let result = TlsTransport::new(&server_transport(identity.path(), Some("password")));
+        let result = TlsTransport::new(
+            &server_transport(identity.path(), Some("password")),
+            TransportRole::Server,
+        );
         assert!(result.is_err());
         Ok(())
     }
@@ -238,7 +262,10 @@ mod tests {
     #[test]
     fn missing_identity_password_returns_error() -> Result<()> {
         let identity = tempfile::NamedTempFile::new()?;
-        let result = TlsTransport::new(&server_transport(identity.path(), None));
+        let result = TlsTransport::new(
+            &server_transport(identity.path(), None),
+            TransportRole::Server,
+        );
 
         let error = result.expect_err("missing PKCS#12 password should fail");
         assert!(error.to_string().contains("tls.pkcs12_password"));

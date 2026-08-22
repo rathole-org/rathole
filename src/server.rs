@@ -16,7 +16,7 @@ use backoff::ExponentialBackoff;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -359,7 +359,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             conn,
             service_config,
             server_config.heartbeat_interval,
-            control_channels.clone(),
+            Arc::downgrade(&control_channels),
             session_key,
         );
 
@@ -415,7 +415,7 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
-        control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+        control_channels: Weak<RwLock<ControlChannelMap<T>>>,
         session_key: Nonce,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
@@ -520,7 +520,9 @@ where
                 if let Err(err) = ch.run().await {
                     error!("{:#}", err);
                 }
-                control_channels.write().await.remove2(&session_key);
+                if let Some(control_channels) = control_channels.upgrade() {
+                    control_channels.write().await.remove2(&session_key);
+                }
             }
             .instrument(Span::current()),
         );
@@ -570,8 +572,9 @@ impl<T: Transport> ControlChannel<T> {
                             debug!("Control channel closed by the client");
                             break;
                         }
-                        Ok(_) => {
-                            // Unexpected data; ignore.
+                        Ok(bytes_read) => {
+                            warn!(bytes_read, "Unexpected data on control channel");
+                            break;
                         }
                         Err(e) => {
                             error!("Control channel read error: {:#}", e);
@@ -919,4 +922,160 @@ async fn run_udp_connection_pool<T: Transport>(
     debug!("UDP pool dropped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+    use std::net::SocketAddr;
+
+    const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn unused_tcp_addr() -> Result<SocketAddr> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        Ok(listener.local_addr()?)
+    }
+
+    async fn connected_tcp_pair() -> Result<(TcpStream, TcpStream)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (client, (server, _)) = tokio::try_join!(TcpStream::connect(addr), listener.accept())?;
+        Ok((server, client))
+    }
+
+    async fn wait_until_listener_is_bound(addr: SocketAddr) -> Result<()> {
+        time::timeout(CLEANUP_TIMEOUT, async {
+            loop {
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => {
+                        drop(listener);
+                        time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) if error.kind() == ErrorKind::AddrInUse => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        })
+        .await
+        .context("service listener was not created before the deadline")?
+    }
+
+    async fn wait_until_listener_is_released(addr: SocketAddr) -> Result<TcpListener> {
+        time::timeout(CLEANUP_TIMEOUT, async {
+            loop {
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => return Ok(listener),
+                    Err(error) if error.kind() == ErrorKind::AddrInUse => {
+                        time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        })
+        .await
+        .context("service listener was not released before the deadline")?
+    }
+
+    async fn wait_until_channel_is_removed(
+        control_channels: &RwLock<ControlChannelMap<TcpTransport>>,
+        service_digest: ServiceDigest,
+        session_key: Nonce,
+    ) -> Result<()> {
+        time::timeout(CLEANUP_TIMEOUT, async {
+            loop {
+                let removed = {
+                    let channels = control_channels.read().await;
+                    channels.get1(&service_digest).is_none()
+                        && channels.get2(&session_key).is_none()
+                };
+                if removed {
+                    return;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("control channel was not removed before the deadline")?;
+        Ok(())
+    }
+
+    fn tcp_service(bind_addr: SocketAddr) -> ServerServiceConfig {
+        ServerServiceConfig {
+            service_type: ServiceType::Tcp,
+            name: "cleanup-test".to_owned(),
+            bind_addr: bind_addr.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn half_closed_control_channel_releases_map_entry_and_listener_without_heartbeat(
+    ) -> Result<()> {
+        let service_addr = unused_tcp_addr()?;
+        let (server_conn, mut client_conn) = connected_tcp_pair().await?;
+        let service_digest = [1_u8; HASH_WIDTH_IN_BYTES];
+        let session_key = [2_u8; HASH_WIDTH_IN_BYTES];
+        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+
+        {
+            // Match the handshake's locking order so cleanup cannot run before insertion.
+            let mut channels = control_channels.write().await;
+            let handle = ControlChannelHandle::<TcpTransport>::new(
+                server_conn,
+                tcp_service(service_addr),
+                0,
+                Arc::downgrade(&control_channels),
+                session_key,
+            );
+            if channels
+                .insert(service_digest, session_key, handle)
+                .is_err()
+            {
+                bail!("failed to insert test control channel");
+            }
+        }
+
+        wait_until_listener_is_bound(service_addr).await?;
+        client_conn.shutdown().await?;
+
+        wait_until_channel_is_removed(&control_channels, service_digest, session_key).await?;
+        let released_listener = wait_until_listener_is_released(service_addr).await?;
+        drop(released_listener);
+        drop(client_conn);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_channel_map_releases_listener_without_retaining_cycle() -> Result<()> {
+        let service_addr = unused_tcp_addr()?;
+        let (server_conn, _client_conn) = connected_tcp_pair().await?;
+        let service_digest = [3_u8; HASH_WIDTH_IN_BYTES];
+        let session_key = [4_u8; HASH_WIDTH_IN_BYTES];
+        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+
+        {
+            let mut channels = control_channels.write().await;
+            let handle = ControlChannelHandle::<TcpTransport>::new(
+                server_conn,
+                tcp_service(service_addr),
+                0,
+                Arc::downgrade(&control_channels),
+                session_key,
+            );
+            if channels
+                .insert(service_digest, session_key, handle)
+                .is_err()
+            {
+                bail!("failed to insert test control channel");
+            }
+        }
+
+        wait_until_listener_is_bound(service_addr).await?;
+        drop(control_channels);
+
+        let released_listener = wait_until_listener_is_released(service_addr).await?;
+        drop(released_listener);
+        Ok(())
+    }
 }

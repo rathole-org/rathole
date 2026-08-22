@@ -17,6 +17,11 @@ const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 /// Client
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
 
+/// How long the surviving direction may stay idle after the peer has
+/// half-closed before the forwarder tears the connection down. Only the
+/// surviving direction is bounded — full-duplex idle traffic is unaffected.
+const DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS: u64 = 120;
+
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
 #[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
@@ -238,6 +243,77 @@ fn default_client_retry_interval() -> u64 {
     DEFAULT_CLIENT_RETRY_INTERVAL_SECS
 }
 
+fn default_post_half_close_idle_timeout() -> PostHalfCloseIdleTimeout {
+    PostHalfCloseIdleTimeout(Some(DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS))
+}
+
+/// Configurable post-half-close idle timeout. Accepts either a non-negative
+/// integer (seconds) or the string `"off"` (disables the timeout entirely,
+/// restoring legacy `copy_bidirectional` behavior).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct PostHalfCloseIdleTimeout(pub Option<u64>);
+
+impl Default for PostHalfCloseIdleTimeout {
+    /// Match the serde missing-field default so a programmatic
+    /// `ClientConfig::default()` / `ServerConfig::default()` doesn't silently
+    /// disable the leak guard.
+    fn default() -> Self {
+        PostHalfCloseIdleTimeout(Some(DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS))
+    }
+}
+
+impl PostHalfCloseIdleTimeout {
+    pub fn as_duration(&self) -> Option<std::time::Duration> {
+        self.0.map(std::time::Duration::from_secs)
+    }
+}
+
+impl Serialize for PostHalfCloseIdleTimeout {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Some(v) => s.serialize_u64(v),
+            None => s.serialize_str("off"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PostHalfCloseIdleTimeout {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = PostHalfCloseIdleTimeout;
+
+            fn expecting(&self, f: &mut Formatter) -> std::fmt::Result {
+                f.write_str(r#"a non-negative integer (seconds) or the string "off""#)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(PostHalfCloseIdleTimeout(Some(v)))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v < 0 {
+                    Err(E::custom("post_half_close_idle_timeout must be >= 0"))
+                } else {
+                    Ok(PostHalfCloseIdleTimeout(Some(v as u64)))
+                }
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.eq_ignore_ascii_case("off") {
+                    Ok(PostHalfCloseIdleTimeout(None))
+                } else {
+                    Err(E::custom(format!(
+                        r#"expected non-negative integer or "off", got {:?}"#,
+                        v
+                    )))
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
@@ -251,6 +327,8 @@ pub struct ClientConfig {
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
     pub retry_interval: u64,
+    #[serde(default = "default_post_half_close_idle_timeout")]
+    pub post_half_close_idle_timeout: PostHalfCloseIdleTimeout,
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -267,6 +345,8 @@ pub struct ServerConfig {
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+    #[serde(default = "default_post_half_close_idle_timeout")]
+    pub post_half_close_idle_timeout: PostHalfCloseIdleTimeout,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -532,5 +612,86 @@ mod tests {
             "4"
         );
         Ok(())
+    }
+
+    #[test]
+    fn post_half_close_idle_timeout_roundtrip() {
+        // Default: programmatic Default and serde missing-field must agree.
+        assert_eq!(
+            PostHalfCloseIdleTimeout::default().0,
+            Some(DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS),
+        );
+
+        let parsed: ClientConfig = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+[services]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.post_half_close_idle_timeout.0,
+            Some(DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS),
+            "missing field must default to {DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS}s"
+        );
+
+        // Numeric value.
+        let parsed: ClientConfig = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+post_half_close_idle_timeout = 30
+[services]
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.post_half_close_idle_timeout.0, Some(30));
+
+        // Zero is valid (immediate teardown after half-close).
+        let parsed: ClientConfig = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+post_half_close_idle_timeout = 0
+[services]
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.post_half_close_idle_timeout.0, Some(0));
+
+        // "off" disables the timeout entirely.
+        let parsed: ClientConfig = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+post_half_close_idle_timeout = "off"
+[services]
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.post_half_close_idle_timeout.0, None);
+
+        // Negative is rejected.
+        let err: Result<ClientConfig, _> = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+post_half_close_idle_timeout = -1
+[services]
+"#,
+        );
+        assert!(err.is_err(), "negative must be rejected");
+
+        // Arbitrary string is rejected.
+        let err: Result<ClientConfig, _> = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+post_half_close_idle_timeout = "later"
+[services]
+"#,
+        );
+        assert!(err.is_err(), "unknown string must be rejected");
     }
 }

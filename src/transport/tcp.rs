@@ -1,9 +1,9 @@
+#[cfg(target_os = "linux")]
+use crate::helper::{tcp_bind_fast_open, to_socket_addr};
 use crate::{
     config::{TcpConfig, TransportConfig},
     helper::tcp_connect_with_proxy,
 };
-#[cfg(target_os = "linux")]
-use crate::helper::{tcp_bind_fast_open, to_socket_addr};
 
 use super::{AddrMaybeCached, SocketOpts, Transport, TransportRole};
 use anyhow::Result;

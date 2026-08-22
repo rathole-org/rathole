@@ -439,13 +439,36 @@ jobs:
         run: |
           set -euo pipefail
 
-          docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}" |
-            jq -e '[.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
+          manifest="$(docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}")"
+          jq -e '[.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]' <<< "${manifest}"
 
           for platform in linux/amd64 linux/arm64; do
-            version_output="$(docker run --rm --platform "${platform}" "${IMAGE}@${DIGEST}" --version 2>&1)"
-            grep -F "Commit SHA:          Some(\"${GITHUB_SHA}\")" <<< "${version_output}"
-            echo "Verified ${platform} runtime"
+            os="${platform%/*}"
+            architecture="${platform#*/}"
+            platform_digest="$(
+              jq -er --arg os "${os}" --arg architecture "${architecture}" '
+                [.manifests[]
+                  | select(.platform.os == $os and .platform.architecture == $architecture)
+                  | .digest]
+                | if length == 1 then .[0] else error("expected exactly one manifest for \($os)/\($architecture)") end
+              ' <<< "${manifest}"
+            )"
+            if [[ ! "${platform_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid manifest digest for ${platform}: ${platform_digest}"
+              exit 1
+            fi
+
+            if ! version_output="$(docker run --rm --platform "${platform}" "${IMAGE}@${platform_digest}" --version 2>&1)"; then
+              printf '%s\n' "${version_output}" >&2
+              echo "::error::Failed to run ${platform} container"
+              exit 1
+            fi
+            if ! grep -F "Commit SHA:          Some(\"${GITHUB_SHA}\")" <<< "${version_output}"; then
+              printf '%s\n' "${version_output}" >&2
+              echo "::error::${platform} container did not report commit ${GITHUB_SHA}"
+              exit 1
+            fi
+            echo "Verified ${platform} runtime at ${platform_digest}"
           done
           echo "Verified ${IMAGE}@${DIGEST}"
       - name: Publish verified container tags

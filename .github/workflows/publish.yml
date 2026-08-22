@@ -3,11 +3,12 @@ name: Publish
 on:
   push:
     branches: [dev]
-    tags: ["v*"]
+  release:
+    types: [published]
 
 concurrency:
-  group: publish-${{ github.ref_type == 'tag' && 'release' || github.ref }}
-  cancel-in-progress: ${{ github.ref == 'refs/heads/dev' }}
+  group: publish-${{ github.event_name == 'release' && 'release' || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
 
 permissions:
   actions: read
@@ -50,8 +51,10 @@ jobs:
         id: release
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
 
@@ -60,21 +63,26 @@ jobs:
           publish_major_alias=false
           publish_minor_alias=false
 
-          if [[ "${REF_TYPE}" == "tag" ]]; then
-            if [[ ! "${REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+          if [[ "${EVENT_NAME}" == "release" ]]; then
+            if [[ "${RELEASE_TAG}" != "${REF_NAME}" ]]; then
+              echo "::error::Release event tag ${RELEASE_TAG} does not match ref ${REF_NAME}"
+              exit 1
+            fi
+            if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
               echo "::error::Release tag must be a semantic version beginning with v"
               exit 1
             fi
 
-            version="${REF_NAME#v}"
+            version="${RELEASE_TAG#v}"
             if [[ "${version}" != "${package_version}" ]]; then
-              echo "::error::Tag ${REF_NAME} does not match Cargo package version ${package_version}"
+              echo "::error::Tag ${RELEASE_TAG} does not match Cargo package version ${package_version}"
               exit 1
             fi
 
             git fetch --no-tags origin main:refs/remotes/origin/main
             if [[ "${version}" == *-* ]]; then
               channel="prerelease"
+              expected_prerelease=true
               on_release_branch=false
               if git ls-remote --exit-code --heads origin dev >/dev/null 2>&1; then
                 git fetch --no-tags origin dev:refs/remotes/origin/dev
@@ -94,6 +102,7 @@ jobs:
               fi
             else
               channel="stable"
+              expected_prerelease=false
               source_branch="main"
               if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
                 echo "::error::Stable tags must point to a commit on main"
@@ -131,16 +140,30 @@ jobs:
               publish_minor_alias="${stable_aliases[2]}"
             fi
 
-            release_tag="${REF_NAME}"
-          else
+            if [[ "${RELEASE_PRERELEASE}" != "${expected_prerelease}" ]]; then
+              echo "::error::GitHub Release prerelease=${RELEASE_PRERELEASE}; expected ${expected_prerelease} for ${RELEASE_TAG}"
+              exit 1
+            fi
+
+            tag_sha="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
+            if [[ "${tag_sha}" != "${GITHUB_SHA}" ]]; then
+              echo "::error::Release tag ${RELEASE_TAG} points to ${tag_sha}, not event SHA ${GITHUB_SHA}"
+              exit 1
+            fi
+
+            resolved_tag="${RELEASE_TAG}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ "${REF_NAME}" != "dev" ]]; then
               echo "::error::Branch publishing is restricted to dev"
               exit 1
             fi
             channel="dev"
-            release_tag="dev-latest"
+            resolved_tag="dev-latest"
             source_branch="dev"
             version="dev"
+          else
+            echo "::error::Unsupported publishing event ${EVENT_NAME}"
+            exit 1
           fi
 
           commit_timestamp="$(git show -s --format=%cI "${GITHUB_SHA}")"
@@ -154,7 +177,7 @@ jobs:
             echo "publish-latest-alias=${publish_latest_alias}"
             echo "publish-major-alias=${publish_major_alias}"
             echo "publish-minor-alias=${publish_minor_alias}"
-            echo "release-tag=${release_tag}"
+            echo "release-tag=${resolved_tag}"
             echo "source-date-epoch=${source_date_epoch}"
             echo "source-branch=${source_branch}"
             echo "version=${version}"
@@ -170,7 +193,7 @@ jobs:
           checksum="$(sha256sum "target/package/rathole-${package_version}.crate" | awk '{print $1}')"
           echo "checksum=${checksum}" >> "${GITHUB_OUTPUT}"
       - name: Guard previously published crate versions
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'release'
         shell: bash
         env:
           PACKAGE_CHECKSUM: ${{ steps.package.outputs.checksum }}
@@ -199,7 +222,6 @@ jobs:
               exit 1
               ;;
           esac
-
   binaries:
     name: Binary (${{ matrix.name }})
     needs: prepare
@@ -472,7 +494,7 @@ jobs:
           done
           echo "Verified ${IMAGE}@${DIGEST}"
       - name: Publish verified container tags
-        if: steps.existing.outputs.exists != 'true'
+        if: needs.prepare.outputs.channel == 'dev' && steps.existing.outputs.exists != 'true'
         shell: bash
         env:
           DIGEST: ${{ steps.digest.outputs.digest }}
@@ -480,14 +502,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          mapfile -t tags < <(printf '%s\n' "${TAGS}" | sed '/^[[:space:]]*$/d')
-          if [[ "${#tags[@]}" -eq 0 ]]; then
+          mapfile -t container_tags < <(printf '%s\n' "${TAGS}" | sed '/^[[:space:]]*$/d')
+          if [[ "${#container_tags[@]}" -eq 0 ]]; then
             echo "::error::No container tags were generated"
             exit 1
           fi
 
           tag_args=()
-          for tag in "${tags[@]}"; do
+          for tag in "${container_tags[@]}"; do
             if [[ "${tag}" != "${IMAGE}:"* ]]; then
               echo "::error::Refusing unexpected container tag ${tag}"
               exit 1
@@ -497,7 +519,7 @@ jobs:
 
           docker buildx imagetools create "${tag_args[@]}" "${IMAGE}@${DIGEST}"
 
-          for tag in "${tags[@]}"; do
+          for tag in "${container_tags[@]}"; do
             inspection="$(docker buildx imagetools inspect "${tag}")"
             published_digest="$(sed -n 's/^Digest:[[:space:]]*//p' <<< "${inspection}" | head -n 1)"
             if [[ "${published_digest}" != "${DIGEST}" ]]; then
@@ -507,67 +529,18 @@ jobs:
             echo "Published ${tag}"
           done
 
-  crate:
-    name: Publish crate
+  assets:
+    name: Stage release assets
     needs: [prepare, binaries, container]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Skip crate publishing for dev
-        if: needs.prepare.outputs.channel == 'dev'
-        run: echo "Crates are published only for version tags"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.prepare.outputs.channel != 'dev'
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        if: needs.prepare.outputs.channel != 'dev'
-        with:
-          cache: false
-          toolchain: ${{ env.RUST_VERSION }}
-          rustflags: ""
-      - name: Publish crate version
-        if: needs.prepare.outputs.channel != 'dev'
-        shell: bash
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
-          PACKAGE_CHECKSUM: ${{ needs.prepare.outputs.crate-checksum }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          response="$(mktemp)"
-          status="$(curl --silent --show-error --retry 3 --retry-delay 2 --output "${response}" --write-out '%{http_code}' \
-            --user-agent 'rathole-release-workflow (https://github.com/rathole-org/rathole)' \
-            "https://crates.io/api/v1/crates/rathole/${VERSION}")"
-          case "${status}" in
-            200)
-              published_checksum="$(jq -er '.version.checksum' "${response}")"
-              if [[ "${PACKAGE_CHECKSUM}" != "${published_checksum}" ]]; then
-                echo "::error::Crate rathole ${VERSION} was published from different source during this run"
-                exit 1
-              fi
-              echo "Crate rathole ${VERSION} already contains this source"
-              ;;
-            404)
-              cargo publish --locked
-              ;;
-            *)
-              echo "::error::crates.io returned HTTP ${status}"
-              exit 1
-              ;;
-          esac
-
-  release:
-    name: Publish release assets
-    needs: [prepare, binaries, container, crate]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       actions: read
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: binary-*
@@ -626,9 +599,47 @@ jobs:
           path: dist
           if-no-files-found: error
           compression-level: 0
-          retention-days: 30
+          retention-days: 35
+      - name: Summarize release request
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+          CRATE_CHECKSUM: ${{ needs.prepare.outputs.crate-checksum }}
+          DIGEST: ${{ needs.container.outputs.digest }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
+        run: |
+          set -euo pipefail
+
+          {
+            printf "## Release request \`%s\`\n\n" "${RELEASE_TAG}"
+            printf -- '- GitHub Release: %s\n' "${RELEASE_URL}"
+            printf -- "- Channel: \`%s\`\n" "${CHANNEL}"
+            printf -- "- Commit: \`%s\`\n" "${GITHUB_SHA}"
+            printf -- "- Crate checksum: \`%s\`\n" "${CRATE_CHECKSUM}"
+            printf -- "- Staged container: \`%s@%s\`\n" "${IMAGE}" "${DIGEST}"
+            printf -- "- Protected publisher: \`release\` environment\n\n"
+            printf "### Binary archives\n\n\`\`\`text\n"
+            cat dist/SHA256SUMS
+            printf "\`\`\`\n"
+          } >> "${GITHUB_STEP_SUMMARY}"
+  dev-release:
+    name: Update rolling dev release
+    if: github.event_name == 'push' && needs.prepare.outputs.channel == 'dev'
+    needs: [prepare, container, assets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets-${{ github.run_id }}
+          path: dist
       - name: Update rolling dev release
-        if: needs.prepare.outputs.channel == 'dev'
         shell: bash
         env:
           DIGEST: ${{ needs.container.outputs.digest }}
@@ -675,31 +686,305 @@ jobs:
 
           gh release edit "${RELEASE_TAG}" --draft --prerelease --title "${title}" --notes-file RELEASE_NOTES.md
           gh release upload "${RELEASE_TAG}" dist/* --clobber
-      - name: Stage tagged release
-        if: needs.prepare.outputs.channel != 'dev'
+
+  publish-release:
+    name: Publish approved release
+    if: github.event_name == 'release' && needs.prepare.outputs.channel != 'dev'
+    needs: [prepare, container, assets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: release
+      url: ${{ github.event.release.html_url }}
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets-${{ github.run_id }}
+          path: dist
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ env.RUST_VERSION }}
+          rustflags: ""
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Revalidate approved release
         shell: bash
         env:
           CHANNEL: ${{ needs.prepare.outputs.channel }}
+          EVENT_PRERELEASE: ${{ github.event.release.prerelease }}
+          EXPECTED_CHECKSUM: ${{ needs.prepare.outputs.crate-checksum }}
+          EXPECTED_LATEST_ALIAS: ${{ needs.prepare.outputs.publish-latest-alias }}
+          EXPECTED_MAJOR_ALIAS: ${{ needs.prepare.outputs.publish-major-alias }}
+          EXPECTED_MINOR_ALIAS: ${{ needs.prepare.outputs.publish-minor-alias }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
+          SOURCE_BRANCH: ${{ needs.prepare.outputs.source-branch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] ||
+             [[ "${RELEASE_TAG#v}" != "${VERSION}" ]]; then
+            echo "::error::Release tag and version are no longer consistent"
+            exit 1
+          fi
+
+          case "${CHANNEL}" in
+            prerelease)
+              expected_prerelease=true
+              ;;
+            stable)
+              expected_prerelease=false
+              ;;
+            *)
+              echo "::error::Protected publisher received channel ${CHANNEL}"
+              exit 1
+              ;;
+          esac
+          if [[ "${EVENT_PRERELEASE}" != "${expected_prerelease}" ]]; then
+            echo "::error::Release channel changed while waiting for approval"
+            exit 1
+          fi
+
+          release_data="$(mktemp)"
+          release_status="$(curl --silent --show-error --retry 3 --retry-delay 2 \
+            --output "${release_data}" --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          if [[ "${release_status}" != "200" ]]; then
+            echo "::error::GitHub returned HTTP ${release_status} for release ${RELEASE_ID}"
+            exit 1
+          fi
+          if ! jq -e \
+            --arg tag "${RELEASE_TAG}" \
+            --argjson prerelease "${expected_prerelease}" \
+            --argjson release_id "${RELEASE_ID}" \
+            '.id == $release_id and .tag_name == $tag and .draft == false and .prerelease == $prerelease and .published_at != null' \
+            "${release_data}" >/dev/null; then
+            echo "::error::GitHub Release was deleted, drafted, retagged, or changed channel while waiting for approval"
+            jq '{id, tag_name, draft, prerelease, published_at}' "${release_data}"
+            exit 1
+          fi
+
+          git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          tag_sha="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
+          head_sha="$(git rev-parse HEAD)"
+          if [[ "${tag_sha}" != "${GITHUB_SHA}" || "${head_sha}" != "${GITHUB_SHA}" ]]; then
+            echo "::error::Release tag, checked-out source, and event SHA are no longer identical"
+            exit 1
+          fi
+
+          git fetch --force --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          if [[ "${CHANNEL}" == "stable" ]]; then
+            if [[ "${SOURCE_BRANCH}" != "main" ]] ||
+               ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+              echo "::error::Stable release is no longer reachable from main"
+              exit 1
+            fi
+          else
+            on_release_branch=false
+            if git ls-remote --exit-code --heads origin dev >/dev/null 2>&1; then
+              git fetch --force --no-tags origin "+refs/heads/dev:refs/remotes/origin/dev"
+              if git merge-base --is-ancestor "${GITHUB_SHA}" origin/dev; then
+                on_release_branch=true
+              fi
+            fi
+            if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main &&
+               [[ "${on_release_branch}" != true ]]; then
+              echo "::error::Prerelease is no longer reachable from dev or main"
+              exit 1
+            fi
+          fi
+
+          latest_alias=false
+          major_alias=false
+          minor_alias=false
+          if [[ "${CHANNEL}" == "stable" ]]; then
+            tag_refs="$(mktemp)"
+            git ls-remote --tags --refs origin 'v*' > "${tag_refs}"
+            mapfile -t stable_aliases < <(
+              python3 - "${VERSION}" "${tag_refs}" <<'PY'
+          import re
+          import sys
+
+          current = tuple(int(part) for part in sys.argv[1].split("."))
+          versions = set()
+          with open(sys.argv[2], encoding="utf-8") as refs:
+              for line in refs:
+                  ref = line.rstrip().split("\t")[-1]
+                  match = re.fullmatch(r"refs/tags/v(\d+)\.(\d+)\.(\d+)", ref)
+                  if match:
+                      versions.add(tuple(int(part) for part in match.groups()))
+
+          if current not in versions:
+              raise SystemExit("release tag is no longer present on origin")
+
+          minor_versions = [candidate for candidate in versions if candidate[:2] == current[:2]]
+          major_versions = [candidate for candidate in versions if candidate[0] == current[0]]
+          print(str(current == max(versions)).lower())
+          print(str(current == max(major_versions)).lower())
+          print(str(current == max(minor_versions)).lower())
+          PY
+            )
+            latest_alias="${stable_aliases[0]}"
+            major_alias="${stable_aliases[1]}"
+            minor_alias="${stable_aliases[2]}"
+          fi
+          if [[ "${latest_alias}" != "${EXPECTED_LATEST_ALIAS}" ]] ||
+             [[ "${major_alias}" != "${EXPECTED_MAJOR_ALIAS}" ]] ||
+             [[ "${minor_alias}" != "${EXPECTED_MINOR_ALIAS}" ]]; then
+            echo "::error::Stable tag ordering changed while waiting for approval; rerun the release workflow"
+            exit 1
+          fi
+
+          cargo package --locked
+          package_checksum="$(sha256sum "target/package/rathole-${VERSION}.crate" | awk '{print $1}')"
+          if [[ "${package_checksum}" != "${EXPECTED_CHECKSUM}" ]]; then
+            echo "::error::Crate package changed while waiting for approval"
+            exit 1
+          fi
+          mapfile -t archives < <(find dist -maxdepth 1 -type f -name 'rathole-*.tar.gz' -printf '%f\n' | sort)
+          if [[ "${#archives[@]}" -ne 9 ]]; then
+            echo "::error::Expected 9 staged archives, found ${#archives[@]}"
+            exit 1
+          fi
+          (cd dist && sha256sum --check SHA256SUMS)
+      - name: Promote verified container tags
+        shell: bash
+        env:
+          DIGEST: ${{ needs.container.outputs.digest }}
+          PUBLISH_LATEST: ${{ needs.prepare.outputs.publish-latest-alias }}
+          PUBLISH_MAJOR: ${{ needs.prepare.outputs.publish-major-alias }}
+          PUBLISH_MINOR: ${{ needs.prepare.outputs.publish-minor-alias }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          for flag in "${PUBLISH_LATEST}" "${PUBLISH_MAJOR}" "${PUBLISH_MINOR}"; do
+            if [[ "${flag}" != "true" && "${flag}" != "false" ]]; then
+              echo "::error::Invalid container alias decision ${flag}"
+              exit 1
+            fi
+          done
+
+          IFS='.' read -r major minor _ <<< "${VERSION}"
+          tags=("${IMAGE}:${VERSION}")
+          if [[ "${PUBLISH_MINOR}" == "true" ]]; then
+            tags+=("${IMAGE}:${major}.${minor}")
+          fi
+          if [[ "${PUBLISH_MAJOR}" == "true" && "${major}" != "0" ]]; then
+            tags+=("${IMAGE}:${major}")
+          fi
+          if [[ "${PUBLISH_LATEST}" == "true" ]]; then
+            tags+=("${IMAGE}:latest")
+          fi
+
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            if [[ "${tag}" != "${IMAGE}:"* ]]; then
+              echo "::error::Refusing unexpected container tag ${tag}"
+              exit 1
+            fi
+            tag_args+=(--tag "${tag}")
+          done
+          docker buildx imagetools create "${tag_args[@]}" "${IMAGE}@${DIGEST}"
+
+          for tag in "${tags[@]}"; do
+            inspection="$(docker buildx imagetools inspect "${tag}")"
+            published_digest="$(sed -n 's/^Digest:[[:space:]]*//p' <<< "${inspection}" | head -n 1)"
+            if [[ "${published_digest}" != "${DIGEST}" ]]; then
+              echo "::error::${tag} resolved to ${published_digest}, expected ${DIGEST}"
+              exit 1
+            fi
+            echo "Published ${tag}"
+          done
+      - name: Publish crate version
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
+          PACKAGE_CHECKSUM: ${{ needs.prepare.outputs.crate-checksum }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          response="$(mktemp)"
+          status="$(curl --silent --show-error --retry 3 --retry-delay 2 --output "${response}" --write-out '%{http_code}' \
+            --user-agent 'rathole-release-workflow (https://github.com/rathole-org/rathole)' \
+            "https://crates.io/api/v1/crates/rathole/${VERSION}")"
+          case "${status}" in
+            200)
+              published_checksum="$(jq -er '.version.checksum' "${response}")"
+              if [[ "${PACKAGE_CHECKSUM}" != "${published_checksum}" ]]; then
+                echo "::error::Crate rathole ${VERSION} already exists with different source"
+                exit 1
+              fi
+              echo "Crate rathole ${VERSION} already contains this source"
+              ;;
+            404)
+              if [[ -z "${CARGO_REGISTRY_TOKEN}" ]]; then
+                echo "::error::CRATES_IO_API_TOKEN is not available to the release environment"
+                exit 1
+              fi
+              cargo publish --locked
+
+              verified=false
+              for _ in {1..12}; do
+                sleep 5
+                status="$(curl --silent --show-error --retry 3 --retry-delay 2 --output "${response}" --write-out '%{http_code}' \
+                  --user-agent 'rathole-release-workflow (https://github.com/rathole-org/rathole)' \
+                  "https://crates.io/api/v1/crates/rathole/${VERSION}")"
+                if [[ "${status}" == "200" ]]; then
+                  published_checksum="$(jq -er '.version.checksum' "${response}")"
+                  if [[ "${PACKAGE_CHECKSUM}" != "${published_checksum}" ]]; then
+                    echo "::error::Published crate checksum does not match the approved source"
+                    exit 1
+                  fi
+                  verified=true
+                  break
+                fi
+              done
+              if [[ "${verified}" != "true" ]]; then
+                echo "::error::Published crate did not become visible on crates.io"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::crates.io returned HTTP ${status}"
+              exit 1
+              ;;
+          esac
+      - name: Upload approved release assets
+        shell: bash
+        env:
+          EXPECTED_PRERELEASE: ${{ github.event.release.prerelease }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
 
-          {
-            printf "Built with Rust \`%s\`.\n\n" "${RUST_VERSION}"
-            printf "Container: \`%s:%s\`\n" "${IMAGE}" "${VERSION}"
-          } > RELEASE_NOTES.md
-
-          release_exists=true
-          if ! release_data="$(gh release view "${RELEASE_TAG}" --json assets,isDraft 2>/dev/null)"; then
-            release_exists=false
-            if [[ "${CHANNEL}" == "prerelease" ]]; then
-              gh release create "${RELEASE_TAG}" --draft --verify-tag --prerelease --generate-notes --title "${RELEASE_TAG}" --notes-file RELEASE_NOTES.md
-            else
-              gh release create "${RELEASE_TAG}" --draft --verify-tag --latest=false --generate-notes --title "${RELEASE_TAG}" --notes-file RELEASE_NOTES.md
-            fi
-            release_data='{"assets":[],"isDraft":true}'
+          release_data="$(gh release view "${RELEASE_TAG}" --json assets,isDraft,isPrerelease,tagName)"
+          if [[ "$(jq -r '.isDraft' <<< "${release_data}")" != "false" ]] ||
+             [[ "$(jq -r '.isPrerelease' <<< "${release_data}")" != "${EXPECTED_PRERELEASE}" ]] ||
+             [[ "$(jq -r '.tagName' <<< "${release_data}")" != "${RELEASE_TAG}" ]]; then
+            echo "::error::Release changed before asset upload"
+            exit 1
           fi
 
           compare_dir="$(mktemp -d)"
@@ -716,80 +1001,62 @@ jobs:
               missing_assets+=("dist/${asset}")
             fi
           done
-
-          stale_assets=false
-          mapfile -t remote_asset_names < <(jq -r '.assets[].name' <<< "${release_data}")
-          for asset in "${remote_asset_names[@]}"; do
-            if [[ "${asset}" == "SHA256SUMS" || "${asset}" == "rathole-${VERSION}-"*.tar.gz ]] &&
-               [[ ! -f "dist/${asset}" ]]; then
-              stale_assets=true
-              break
-            fi
-          done
-
-          if [[ "${release_exists}" == "true" ]] &&
-             [[ "$(jq -r '.isDraft' <<< "${release_data}")" != "true" ]] &&
-             { [[ "${#missing_assets[@]}" -gt 0 ]] || [[ "${stale_assets}" == "true" ]]; }; then
-            gh release edit "${RELEASE_TAG}" --draft
-          fi
           if [[ "${#missing_assets[@]}" -gt 0 ]]; then
             gh release upload "${RELEASE_TAG}" "${missing_assets[@]}"
           fi
-      - name: Remove stale managed release assets
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
 
-          remote_assets="$(gh release view "${RELEASE_TAG}" --json assets)"
-          mapfile -t asset_names < <(jq -r '.assets[].name' <<< "${remote_assets}")
-          for asset in "${asset_names[@]}"; do
+          mapfile -t remote_asset_names < <(jq -r '.assets[].name' <<< "${release_data}")
+          for asset in "${remote_asset_names[@]}"; do
             if [[ "${asset}" == "SHA256SUMS" || "${asset}" == "rathole-${VERSION}-"*.tar.gz ]] &&
                [[ ! -f "dist/${asset}" ]]; then
               gh release delete-asset "${RELEASE_TAG}" "${asset}" --yes
             fi
           done
-      - name: Verify staged release assets
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
-        run: |
-          set -euo pipefail
 
-          remote_assets="$(gh release view "${RELEASE_TAG}" --json assets)"
+          release_data="$(gh release view "${RELEASE_TAG}" --json assets,isDraft,isPrerelease,tagName)"
+          if [[ "$(jq -r '.isDraft' <<< "${release_data}")" != "false" ]] ||
+             [[ "$(jq -r '.isPrerelease' <<< "${release_data}")" != "${EXPECTED_PRERELEASE}" ]] ||
+             [[ "$(jq -r '.tagName' <<< "${release_data}")" != "${RELEASE_TAG}" ]]; then
+            echo "::error::Release changed during asset upload"
+            exit 1
+          fi
           compare_dir="$(mktemp -d)"
-          mapfile -t local_assets < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
           for asset in "${local_assets[@]}"; do
-            if ! jq -e --arg asset "${asset}" 'any(.assets[]; .name == $asset)' <<< "${remote_assets}" >/dev/null; then
+            if ! jq -e --arg asset "${asset}" 'any(.assets[]; .name == $asset)' <<< "${release_data}" >/dev/null; then
               echo "::error::Release asset ${asset} is missing"
               exit 1
             fi
             gh release download "${RELEASE_TAG}" --pattern "${asset}" --dir "${compare_dir}"
             if ! cmp -s "dist/${asset}" "${compare_dir}/${asset}"; then
-              echo "::error::Release asset ${asset} does not match the staged artifact"
+              echo "::error::Release asset ${asset} does not match the approved artifact"
               exit 1
             fi
           done
-      - name: Publish staged release
+      - name: Set stable latest-release status
+        if: needs.prepare.outputs.channel == 'stable'
         shell: bash
         env:
-          CHANNEL: ${{ needs.prepare.outputs.channel }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PUBLISH_LATEST: ${{ needs.prepare.outputs.publish-latest-alias }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release-tag }}
         run: |
           set -euo pipefail
 
-          if [[ "${CHANNEL}" == "stable" ]]; then
-            if [[ "${PUBLISH_LATEST}" == "true" ]]; then
-              gh release edit "${RELEASE_TAG}" --draft=false --prerelease=false --latest
-            else
-              gh release edit "${RELEASE_TAG}" --draft=false --prerelease=false --latest=false
-            fi
+          if [[ "${PUBLISH_LATEST}" == "true" ]]; then
+            gh release edit "${RELEASE_TAG}" --latest
           else
-            gh release edit "${RELEASE_TAG}" --draft=false --prerelease
+            gh release edit "${RELEASE_TAG}" --latest=false
           fi
+      - name: Summarize published release
+        shell: bash
+        env:
+          DIGEST: ${{ needs.container.outputs.digest }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          {
+            printf '## Approved release published\n\n'
+            printf -- '- GitHub Release: %s\n' "${RELEASE_URL}"
+            printf -- '- crates.io: https://crates.io/crates/rathole/%s\n' "${VERSION}"
+            printf -- "- Container: \`%s:%s\` (\`%s\`)\n" "${IMAGE}" "${VERSION}" "${DIGEST}"
+          } >> "${GITHUB_STEP_SUMMARY}"

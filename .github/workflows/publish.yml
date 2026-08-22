@@ -392,7 +392,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},enable=${{ needs.prepare.outputs.publish-minor-alias == 'true' }}
             type=semver,pattern={{major}},enable=${{ needs.prepare.outputs.publish-major-alias == 'true' && !startsWith(needs.prepare.outputs.version, '0.') }}
             type=raw,value=latest,enable=${{ needs.prepare.outputs.publish-latest-alias == 'true' }}
-      - name: Build and push container
+      - name: Build and stage container by digest
         id: build
         if: steps.existing.outputs.exists != 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -400,8 +400,7 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             SOURCE_DATE_EPOCH=${{ needs.prepare.outputs.source-date-epoch }}
@@ -449,6 +448,41 @@ jobs:
             echo "Verified ${platform} runtime"
           done
           echo "Verified ${IMAGE}@${DIGEST}"
+      - name: Publish verified container tags
+        if: steps.existing.outputs.exists != 'true'
+        shell: bash
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t tags < <(printf '%s\n' "${TAGS}" | sed '/^[[:space:]]*$/d')
+          if [[ "${#tags[@]}" -eq 0 ]]; then
+            echo "::error::No container tags were generated"
+            exit 1
+          fi
+
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            if [[ "${tag}" != "${IMAGE}:"* ]]; then
+              echo "::error::Refusing unexpected container tag ${tag}"
+              exit 1
+            fi
+            tag_args+=(--tag "${tag}")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${IMAGE}@${DIGEST}"
+
+          for tag in "${tags[@]}"; do
+            inspection="$(docker buildx imagetools inspect "${tag}")"
+            published_digest="$(sed -n 's/^Digest:[[:space:]]*//p' <<< "${inspection}" | head -n 1)"
+            if [[ "${published_digest}" != "${DIGEST}" ]]; then
+              echo "::error::${tag} resolved to ${published_digest}, expected ${DIGEST}"
+              exit 1
+            fi
+            echo "Published ${tag}"
+          done
 
   crate:
     name: Publish crate

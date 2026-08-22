@@ -6,7 +6,7 @@ use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
     DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
 };
-use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
+use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport, TransportRole};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
@@ -93,8 +93,10 @@ struct Client<T: Transport> {
 impl<T: 'static + Transport> Client<T> {
     // Create a Client from `[client]` config block
     async fn from(config: ClientConfig) -> Result<Client<T>> {
-        let transport =
-            Arc::new(T::new(&config.transport).with_context(|| "Failed to create the transport")?);
+        let transport = Arc::new(
+            T::new(&config.transport, TransportRole::Client)
+                .with_context(|| "Failed to create the transport")?,
+        );
         Ok(Client {
             config,
             service_handles: HashMap::new(),

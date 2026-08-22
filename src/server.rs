@@ -8,7 +8,7 @@ use crate::protocol::{
     self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
     HASH_WIDTH_IN_BYTES,
 };
-use crate::transport::{SocketOpts, TcpTransport, Transport};
+use crate::transport::{SocketOpts, TcpTransport, Transport, TransportRole};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
@@ -129,7 +129,7 @@ impl<T: 'static + Transport> Server<T> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
-        let transport = Arc::new(T::new(&config.transport)?);
+        let transport = Arc::new(T::new(&config.transport, TransportRole::Server)?);
         Ok(Server {
             config,
             services,

@@ -4,9 +4,9 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
-use super::{AddrMaybeCached, SocketOpts, TcpTransport, TlsTransport, Transport};
+use super::{AddrMaybeCached, SocketOpts, TcpTransport, TlsTransport, Transport, TransportRole};
 use crate::config::TransportConfig;
-use anyhow::anyhow;
+use anyhow::{anyhow, Context as _};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::stream::Stream;
@@ -184,7 +184,7 @@ impl Transport for WebsocketTransport {
     type RawStream = TcpStream;
     type Stream = WebsocketTunnel;
 
-    fn new(config: &TransportConfig) -> anyhow::Result<Self> {
+    fn new(config: &TransportConfig, role: TransportRole) -> anyhow::Result<Self> {
         let wsconfig = config
             .websocket
             .as_ref()
@@ -195,8 +195,8 @@ impl Transport for WebsocketTransport {
             ..WebSocketConfig::default()
         };
         let sub = match wsconfig.tls {
-            true => SubTransport::Secure(TlsTransport::new(config)?),
-            false => SubTransport::Insecure(TcpTransport::new(config)?),
+            true => SubTransport::Secure(TlsTransport::new(config, role)?),
+            false => SubTransport::Insecure(TcpTransport::new(config, role)?),
         };
         Ok(WebsocketTransport { sub, conf })
     }
@@ -234,17 +234,63 @@ impl Transport for WebsocketTransport {
 
     async fn connect(&self, addr: &AddrMaybeCached) -> anyhow::Result<Self::Stream> {
         let u = format!("ws://{}", addr.addr.as_str());
-        let url = Url::parse(&u).unwrap();
+        let url = Url::parse(&u).with_context(|| format!("Invalid WebSocket URL `{u}`"))?;
         let tstream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.connect(addr).await?),
             SubTransport::Secure(t) => TransportStream::Secure(Box::new(t.connect(addr).await?)),
         };
         let (wsstream, _) = client_async_with_config(url, tstream, Some(self.conf))
             .await
-            .expect("failed to connect");
+            .context("Failed to complete WebSocket client handshake")?;
         let tun = WebsocketTunnel {
             inner: StreamReader::new(StreamWrapper { inner: wsstream }),
         };
         Ok(tun)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{TlsConfig, TransportType, WebsocketConfig};
+    use std::fs;
+
+    fn secure_websocket_transport(tls: TlsConfig) -> TransportConfig {
+        TransportConfig {
+            transport_type: TransportType::Websocket,
+            tls: Some(tls),
+            websocket: Some(WebsocketConfig { tls: true }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn secure_websocket_server_without_identity_returns_error() {
+        let config = secure_websocket_transport(TlsConfig {
+            hostname: None,
+            trusted_root: None,
+            pkcs12: None,
+            pkcs12_password: None,
+        });
+
+        let error = WebsocketTransport::new(&config, TransportRole::Server)
+            .expect_err("missing server identity should fail during transport construction");
+        assert!(error.to_string().contains("tls.pkcs12"));
+    }
+
+    #[test]
+    fn secure_websocket_client_with_invalid_trust_returns_error() -> anyhow::Result<()> {
+        let trusted_root = tempfile::NamedTempFile::new()?;
+        fs::write(trusted_root.path(), b"not a PEM certificate")?;
+        let config = secure_websocket_transport(TlsConfig {
+            hostname: None,
+            trusted_root: Some(trusted_root.path().to_string_lossy().into_owned()),
+            pkcs12: None,
+            pkcs12_password: None,
+        });
+
+        WebsocketTransport::new(&config, TransportRole::Client)
+            .expect_err("invalid client trust should fail during transport construction");
+        Ok(())
     }
 }

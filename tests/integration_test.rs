@@ -3,13 +3,14 @@ use common::{run_rathole_client, PING, PONG};
 use rand::Rng;
 use rand::RngCore;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::AsyncFnOnce;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpStream, UdpSocket},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::{broadcast, oneshot},
     task::{JoinHandle, JoinSet},
     time,
@@ -35,6 +36,7 @@ const PINGPONG_SERVER_SOCKET_EXPOSED: &str = "/tmp/rathole_integration_test/ping
 const HITTER_NUM: usize = 4;
 const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const INTEGRATION_SCENARIO_TIMEOUT: Duration = Duration::from_secs(60);
+const CONTROL_CHANNEL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
 const TLS_SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -57,6 +59,104 @@ fn init() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from(level)),
         )
         .try_init();
+}
+
+fn reserve_tcp_addrs() -> Result<(SocketAddr, SocketAddr)> {
+    let server = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let service = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok((server.local_addr()?, service.local_addr()?))
+}
+
+async fn wait_until_tcp_listener_is_bound(addr: SocketAddr) -> Result<()> {
+    time::timeout(CONTROL_CHANNEL_CLEANUP_TIMEOUT, async {
+        loop {
+            match TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    drop(listener);
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) if error.kind() == ErrorKind::AddrInUse => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    })
+    .await
+    .context("service listener was not created before the deadline")?
+}
+
+async fn wait_until_tcp_listener_is_released(addr: SocketAddr) -> Result<TcpListener> {
+    time::timeout(CONTROL_CHANNEL_CLEANUP_TIMEOUT, async {
+        loop {
+            match TcpListener::bind(addr).await {
+                Ok(listener) => return Ok(listener),
+                Err(error) if error.kind() == ErrorKind::AddrInUse => {
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    })
+    .await
+    .context("service listener was not released before the deadline")?
+}
+
+#[tokio::test]
+async fn disconnected_client_releases_listener_without_heartbeat() -> Result<()> {
+    init();
+
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+
+    let (server_addr, service_addr) = reserve_tcp_addrs()?;
+    let config_dir = tempfile::tempdir()?;
+    let config_path = config_dir.path().join("control-channel-cleanup.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[client]
+remote_addr = "{server_addr}"
+default_token = "test-token"
+
+[client.transport]
+type = "tcp"
+
+[client.services.cleanup]
+local_addr = "127.0.0.1:1"
+
+[server]
+bind_addr = "{server_addr}"
+default_token = "test-token"
+heartbeat_interval = 0
+
+[server.transport]
+type = "tcp"
+
+[server.services.cleanup]
+bind_addr = "{service_addr}"
+"#
+        ),
+    )?;
+
+    run_managed_scenario(
+        config_path,
+        "control-channel cleanup scenario",
+        INTEGRATION_SCENARIO_TIMEOUT,
+        async move |processes| {
+            processes.start_server();
+            processes.start_client();
+            wait_until_tcp_listener_is_bound(service_addr).await?;
+            processes.check_running().await?;
+
+            processes.stop_client().await?;
+            let released_listener = wait_until_tcp_listener_is_released(service_addr).await?;
+            check_task("server", &mut processes.server).await?;
+            drop(released_listener);
+            Ok(())
+        },
+    )
+    .await
 }
 
 #[tokio::test]

@@ -127,6 +127,9 @@ p12 = { version = "0.6.3", optional = true }
 [target.'cfg(target_env = "musl")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 vergen-gitcl = { version = "9.1.0", default-features = false, features = [
     "build",

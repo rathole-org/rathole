@@ -118,6 +118,7 @@ proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. The proxy used to conn
 nodelay = true # Optional. Determine whether to enable TCP_NODELAY, if applicable, to improve the latency but decrease the bandwidth. Default: true
 keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
 keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
+fast_open = false # Optional. Enable TCP Fast Open (`TCP_FASTOPEN`). Linux only; setting this to `true` on other platforms is a configuration error. Default: false
 
 [client.transport.tls] # Necessary if `type` is "tls"
 trusted_root = "ca.pem" # Necessary. The certificate of CA that signed the server's certificate

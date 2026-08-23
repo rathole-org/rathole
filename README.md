@@ -105,7 +105,7 @@ Here is the full configuration specification:
 
 ```toml
 [client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
+remote_addr = "example.com:2333" # Optional. The default address of the server. Required unless every service overrides it via `[client.services.<name>].remote_addr`. See `examples/multi_server` for the multi-server pattern.
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
 heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
@@ -135,6 +135,7 @@ tls = true # If `true` then it will use settings in `client.transport.tls`
 type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp", "socket_stream"]. Default: "tcp"
 token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
+remote_addr = "alt.example.com:2333" # Optional. Override `client.remote_addr` for this one service. Useful when a single client tunnels different services to different servers. The transport block (TLS / Noise / WebSocket) is shared across services, so all overridden servers must accept the same transport configuration.
 nodelay = true # Optional. Override the `client.transport.nodelay` per service
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
 

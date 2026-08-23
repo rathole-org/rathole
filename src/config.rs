@@ -64,6 +64,7 @@ pub struct ClientServiceConfig {
     #[serde(skip)]
     pub name: String,
     pub local_addr: String,
+    pub remote_addr: Option<String>,
     #[serde(default)] // Default to false
     pub prefer_ipv6: bool,
     pub token: Option<MaskedString>,
@@ -241,7 +242,7 @@ fn default_client_retry_interval() -> u64 {
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    pub remote_addr: String,
+    pub remote_addr: Option<String>,
     pub default_token: Option<MaskedString>,
     pub prefer_ipv6: Option<bool>,
     pub services: HashMap<String, ClientServiceConfig>,
@@ -324,6 +325,15 @@ impl Config {
             }
             if s.retry_interval.is_none() {
                 s.retry_interval = Some(client.retry_interval);
+            }
+            if s.remote_addr.is_none() {
+                s.remote_addr = client.remote_addr.clone();
+            }
+            if s.remote_addr.is_none() {
+                bail!(
+                    "The remote_addr of service {} is not set, and no global client.remote_addr is configured",
+                    name
+                );
             }
         }
 
@@ -544,7 +554,10 @@ mod tests {
 
     #[test]
     fn test_validate_client_config() -> Result<()> {
-        let mut cfg = ClientConfig::default();
+        let mut cfg = ClientConfig {
+            remote_addr: Some("example.com:2333".into()),
+            ..Default::default()
+        };
 
         cfg.services.insert(
             "foo1".into(),
@@ -588,6 +601,137 @@ mod tests {
                 .unwrap()
                 .0,
             "4"
+        );
+
+        // Service inherits the global remote_addr
+        assert_eq!(
+            cfg.services
+                .get("foo1")
+                .unwrap()
+                .remote_addr
+                .as_deref(),
+            Some("example.com:2333"),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_client_config_per_service_remote_addr() -> Result<()> {
+        // No global remote_addr, but every service supplies its own — must validate.
+        let mut cfg = ClientConfig {
+            remote_addr: None,
+            default_token: Some("t".into()),
+            ..Default::default()
+        };
+        cfg.services.insert(
+            "a".into(),
+            ClientServiceConfig {
+                name: "a".into(),
+                local_addr: "127.0.0.1:80".into(),
+                remote_addr: Some("a.example.com:2333".into()),
+                ..Default::default()
+            },
+        );
+        cfg.services.insert(
+            "b".into(),
+            ClientServiceConfig {
+                name: "b".into(),
+                local_addr: "127.0.0.1:81".into(),
+                remote_addr: Some("b.example.com:2333".into()),
+                ..Default::default()
+            },
+        );
+        Config::validate_client_config(&mut cfg)?;
+        assert_eq!(
+            cfg.services.get("a").unwrap().remote_addr.as_deref(),
+            Some("a.example.com:2333"),
+        );
+        assert_eq!(
+            cfg.services.get("b").unwrap().remote_addr.as_deref(),
+            Some("b.example.com:2333"),
+        );
+
+        // Neither global nor per-service remote_addr — must fail.
+        let mut cfg = ClientConfig {
+            remote_addr: None,
+            default_token: Some("t".into()),
+            ..Default::default()
+        };
+        cfg.services.insert(
+            "a".into(),
+            ClientServiceConfig {
+                name: "a".into(),
+                local_addr: "127.0.0.1:80".into(),
+                remote_addr: None,
+                ..Default::default()
+            },
+        );
+        assert!(Config::validate_client_config(&mut cfg).is_err());
+
+        // Global set + per-service override → service must keep its own value
+        // (the override is preserved, not clobbered by the fallback).
+        let mut cfg = ClientConfig {
+            remote_addr: Some("global.example.com:2333".into()),
+            default_token: Some("t".into()),
+            ..Default::default()
+        };
+        cfg.services.insert(
+            "override".into(),
+            ClientServiceConfig {
+                name: "override".into(),
+                local_addr: "127.0.0.1:80".into(),
+                remote_addr: Some("override.example.com:2333".into()),
+                ..Default::default()
+            },
+        );
+        cfg.services.insert(
+            "inherit".into(),
+            ClientServiceConfig {
+                name: "inherit".into(),
+                local_addr: "127.0.0.1:81".into(),
+                remote_addr: None,
+                ..Default::default()
+            },
+        );
+        Config::validate_client_config(&mut cfg)?;
+        assert_eq!(
+            cfg.services.get("override").unwrap().remote_addr.as_deref(),
+            Some("override.example.com:2333"),
+            "per-service remote_addr must win over global",
+        );
+        assert_eq!(
+            cfg.services.get("inherit").unwrap().remote_addr.as_deref(),
+            Some("global.example.com:2333"),
+            "service without override must inherit global remote_addr",
+        );
+
+        // Token AND remote_addr both missing — token validation runs first
+        // so the token error is what surfaces. Lock that order in to catch
+        // accidental reordering of the validator.
+        let mut cfg = ClientConfig {
+            remote_addr: None,
+            default_token: None,
+            ..Default::default()
+        };
+        cfg.services.insert(
+            "broken".into(),
+            ClientServiceConfig {
+                name: "broken".into(),
+                local_addr: "127.0.0.1:80".into(),
+                token: None,
+                remote_addr: None,
+                ..Default::default()
+            },
+        );
+        let err = Config::validate_client_config(&mut cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("token"),
+            "expected token error first, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("remote_addr"),
+            "remote_addr error must not surface when token is also missing, got {msg:?}"
         );
         Ok(())
     }

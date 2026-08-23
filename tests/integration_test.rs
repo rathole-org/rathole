@@ -1,6 +1,7 @@
 use anyhow::{Ok, Result};
 use common::{run_rathole_client, PING, PONG};
 use rand::Rng;
+use rathole::UDP_BUFFER_SIZE;
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -19,7 +20,9 @@ const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 const PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8081";
 const ECHO_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2334";
 const PINGPONG_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2335";
-const HITTER_NUM: usize = 4;
+const TCP_HITTER_NUM: usize = 4;
+const UDP_HITTER_NUM: usize = 8;
+const UDP_ROUNDS: usize = 50;
 
 #[derive(Clone, Copy, Debug)]
 enum Type {
@@ -193,9 +196,14 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     // Simulate heavy load
     info!("lots of echo and pingpong");
 
+    let hitter_num = match t {
+        Type::Tcp => TCP_HITTER_NUM,
+        Type::Udp => UDP_HITTER_NUM,
+    };
+
     let mut v = Vec::new();
 
-    for _ in 0..HITTER_NUM / 2 {
+    for _ in 0..hitter_num / 2 {
         v.push(tokio::spawn(async move {
             echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
         }));
@@ -254,18 +262,19 @@ async fn udp_echo_hitter(addr: &'static str) -> Result<()> {
     let conn = UdpSocket::bind("127.0.0.1:0").await?;
     conn.connect(addr).await?;
 
-    let mut wr = [0u8; 128];
-    let mut rd = [0u8; 128];
-    for _ in 0..3 {
-        rand::thread_rng().fill(&mut wr);
+    let mut wr = [0u8; UDP_BUFFER_SIZE];
+    let mut rd = [0u8; UDP_BUFFER_SIZE];
+    for _ in 0..UDP_ROUNDS {
+        let len = rand::thread_rng().gen_range(1..=UDP_BUFFER_SIZE);
+        rand::thread_rng().fill(&mut wr[..len]);
 
-        conn.send(&wr).await?;
-        debug!("send");
+        conn.send(&wr[..len]).await?;
+        debug!("send {} bytes", len);
 
-        conn.recv(&mut rd).await?;
-        debug!("recv");
+        let n = conn.recv(&mut rd).await?;
+        debug!("recv {} bytes", n);
 
-        assert_eq!(wr, rd);
+        assert_eq!(wr[..len], rd[..n]);
     }
     Ok(())
 }
@@ -292,7 +301,7 @@ async fn udp_pingpong_hitter(addr: &'static str) -> Result<()> {
     let wr = PING.as_bytes();
     let mut rd = [0u8; PONG.len()];
 
-    for _ in 0..3 {
+    for _ in 0..UDP_ROUNDS {
         conn.send(wr).await?;
         debug!("ping");
 

@@ -216,3 +216,7 @@ For more details, see the separate page [Benchmark](./docs/benchmark.md).
 - [ ] HTTP APIs for configuration
 
 [Out of Scope](./docs/out-of-scope.md) lists features that are not planned to be implemented and why.
+
+## Maintainers
+
+See [Releasing rathole](./docs/releasing.md) for the protected versioned-release procedure.

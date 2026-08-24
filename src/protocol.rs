@@ -30,6 +30,7 @@ pub enum Ack {
     Ok,
     ServiceNotExist,
     AuthFailed,
+    ServiceAtFullCapacity,
 }
 
 impl std::fmt::Display for Ack {
@@ -41,6 +42,7 @@ impl std::fmt::Display for Ack {
                 Ack::Ok => "Ok",
                 Ack::ServiceNotExist => "Service not exist",
                 Ack::AuthFailed => "Incorrect token",
+                Ack::ServiceAtFullCapacity => "Service at maximum capacity (max_clients limit reached)",
             }
         )
     }

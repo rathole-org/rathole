@@ -168,6 +168,7 @@ tls = true # If `true` then it will use settings in `server.transport.tls`
 type = "tcp" # Optional. Same as the client `[client.services.X.type]
 token = "whatever" # Necessary if `server.default_token` not set
 bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
+max_clients = 10 # Optional. 限制此服务的并发连接数。默认值：无限制
 nodelay = true # Optional. Same as the client
 
 [server.services.service2]

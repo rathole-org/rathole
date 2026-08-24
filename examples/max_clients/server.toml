@@ -1,0 +1,9 @@
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "simple_test"
+heartbeat_interval = 10
+
+# Simple test with single client limit
+[server.services.test_service]
+bind_addr = "0.0.0.0:5555"
+max_clients = 1

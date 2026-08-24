@@ -15,11 +15,12 @@ use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
@@ -37,6 +38,126 @@ const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP serv
 const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+
+/// Tracks active connections for a service and enforces max_clients limit
+struct ServiceConnectionTracker {
+    /// Current number of active connections (for logging/metrics)
+    active_connections: Arc<AtomicUsize>,
+    /// Maximum allowed connections (None = unlimited)
+    max_clients: Option<usize>,
+    /// Semaphore for slot management (None = unlimited)
+    semaphore: Option<Arc<Semaphore>>,
+}
+
+impl ServiceConnectionTracker {
+    /// Create a new connection tracker
+    fn new(max_clients: Option<usize>) -> Self {
+        // Treat 0 as unlimited for backward compatibility
+        let effective_max = max_clients.filter(|&max| max > 0);
+        
+        let semaphore = effective_max.map(|max| Arc::new(Semaphore::new(max)));
+        
+        Self {
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            max_clients: effective_max,
+            semaphore,
+        }
+    }
+    
+    /// Try to acquire a connection slot (non-blocking)
+    /// Returns Some(permit) if successful, None if at capacity
+    fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if let Some(sem) = &self.semaphore {
+            // Try to acquire without blocking - returns None if full
+            Arc::clone(sem).try_acquire_owned().ok()
+        } else {
+            // Unlimited mode - always succeed with no permit needed
+            // We use a dummy permit approach by returning None to indicate unlimited
+            None
+        }
+    }
+    
+    /// Get current number of active connections
+    fn current_connections(&self) -> usize {
+        self.active_connections.load(Ordering::SeqCst)
+    }
+    
+    /// Get the configured limit (None = unlimited)
+    fn get_limit(&self) -> Option<usize> {
+        self.max_clients
+    }
+    
+    /// Increment connection counter
+    fn increment(&self) {
+        self.active_connections.fetch_add(1, Ordering::SeqCst);
+    }
+    
+    /// Decrement connection counter
+    fn decrement(&self) {
+        self.active_connections.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// RAII guard that automatically releases a connection slot when dropped
+struct ConnectionGuard {
+    tracker: Arc<ServiceConnectionTracker>,
+    service_name: String,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl ConnectionGuard {
+    /// Try to acquire a connection slot
+    fn try_new(
+        tracker: Arc<ServiceConnectionTracker>,
+        service_name: String,
+    ) -> Result<Self> {
+        let permit = tracker.try_acquire();
+        
+        // Check if we need a permit and whether we got one
+        if tracker.semaphore.is_some() && permit.is_none() {
+            // Limited mode and no slot available
+            let current = tracker.current_connections();
+            bail!(
+                "Service '{}' at maximum capacity: {}/{:?} clients",
+                service_name,
+                current,
+                tracker.get_limit()
+            );
+        }
+        
+        // Increment counter for logging
+        tracker.increment();
+        let count = tracker.current_connections();
+        
+        info!(
+            "Client connected to service '{}': {}/{} slots used",
+            service_name,
+            count,
+            tracker.get_limit().map_or("unlimited".to_string(), |l| l.to_string())
+        );
+        
+        Ok(Self {
+            tracker,
+            service_name,
+            _permit: permit,
+        })
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        // Decrement counter
+        self.tracker.decrement();
+        let count = self.tracker.current_connections();
+        
+        info!(
+            "Client disconnected from service '{}': {}/{} slots used (slot freed)",
+            self.service_name,
+            count,
+            self.tracker.get_limit().map_or("unlimited".to_string(), |l| l.to_string())
+        );
+    }
+}
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -101,6 +222,8 @@ struct Server<T: Transport> {
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     // Collection of contorl channels
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    // Connection trackers per service, indexed by ServiceDigest
+    connection_trackers: Arc<RwLock<HashMap<ServiceDigest, Arc<ServiceConnectionTracker>>>>,
     // Wrapper around the transport layer
     transport: Arc<T>,
 }
@@ -122,11 +245,23 @@ impl<T: 'static + Transport> Server<T> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+        
+        // Create connection trackers for each service
+        let mut trackers = HashMap::new();
+        for (name, service) in &config.services {
+            let digest = protocol::digest(name.as_bytes());
+            let tracker = Arc::new(ServiceConnectionTracker::new(service.max_clients));
+            trackers.insert(digest, tracker);
+        }
+        info!("Initialized connection tracking for {} services", config.services.len());
+        let connection_trackers = Arc::new(RwLock::new(trackers));
+        
         let transport = Arc::new(T::new(&config.transport)?);
         Ok(Server {
             config,
             services,
             control_channels,
+            connection_trackers,
             transport,
         })
     }
@@ -186,9 +321,10 @@ impl<T: 'static + Transport> Server<T> {
                                         Ok(conn) => {
                                             let services = self.services.clone();
                                             let control_channels = self.control_channels.clone();
+                                            let connection_trackers = self.connection_trackers.clone();
                                             let server_config = self.config.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, connection_trackers, server_config).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -227,6 +363,11 @@ impl<T: 'static + Transport> Server<T> {
             ConfigChange::ServerChange(server_change) => match server_change {
                 ServerServiceChange::Add(cfg) => {
                     let hash = protocol::digest(cfg.name.as_bytes());
+                    
+                    // Create connection tracker for the new service
+                    let tracker = Arc::new(ServiceConnectionTracker::new(cfg.max_clients));
+                    self.connection_trackers.write().await.insert(hash, tracker);
+                    
                     let mut wg = self.services.write().await;
                     let _ = wg.insert(hash, cfg);
 
@@ -236,6 +377,9 @@ impl<T: 'static + Transport> Server<T> {
                 ServerServiceChange::Delete(s) => {
                     let hash = protocol::digest(s.as_bytes());
                     let _ = self.services.write().await.remove(&hash);
+                    
+                    // Remove connection tracker for deleted service
+                    let _ = self.connection_trackers.write().await.remove(&hash);
 
                     let mut wg = self.control_channels.write().await;
                     let _ = wg.remove1(&hash);
@@ -251,6 +395,7 @@ async fn handle_connection<T: 'static + Transport>(
     mut conn: T::Stream,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    connection_trackers: Arc<RwLock<HashMap<ServiceDigest, Arc<ServiceConnectionTracker>>>>,
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
     // Read hello
@@ -261,6 +406,7 @@ async fn handle_connection<T: 'static + Transport>(
                 conn,
                 services,
                 control_channels,
+                connection_trackers,
                 service_digest,
                 server_config,
             )
@@ -277,6 +423,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     mut conn: T::Stream,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    connection_trackers: Arc<RwLock<HashMap<ServiceDigest, Arc<ServiceConnectionTracker>>>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
@@ -309,6 +456,37 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     .to_owned();
 
     let service_name = &service_config.name;
+
+    // Get the SHARED connection tracker for this service
+    let connection_tracker = connection_trackers
+        .read()
+        .await
+        .get(&service_digest)
+        .cloned()
+        .ok_or_else(|| anyhow!("Connection tracker not found for service"))?;
+    let connection_guard = match ConnectionGuard::try_new(
+        connection_tracker.clone(),
+        service_name.clone(),
+    ) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            // Slot acquisition failed - service at capacity
+            warn!(
+                "Service '{}' rejected client connection: max_clients limit ({}) reached. Current active: {}/{}",
+                service_name,
+                connection_tracker.get_limit().unwrap_or(0),
+                connection_tracker.current_connections(),
+                connection_tracker.get_limit().unwrap_or(0)
+            );
+            
+            // Send rejection to client
+            conn.write_all(&bincode::serialize(&Ack::ServiceAtFullCapacity).unwrap())
+                .await?;
+            conn.flush().await?;
+            
+            return Err(e);
+        }
+    };
 
     // Calculate the checksum
     let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
@@ -349,7 +527,15 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
         info!(service = %service_config.name, "Control channel established");
         let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+            ControlChannelHandle::new(
+                conn,
+                service_config,
+                server_config.heartbeat_interval,
+                connection_tracker,
+                connection_guard,
+                control_channels.clone(),
+                service_digest,
+            );
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -390,6 +576,10 @@ pub struct ControlChannelHandle<T: Transport> {
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<T::Stream>,
     service: ServerServiceConfig,
+    // Stored for future use (metrics/monitoring)
+    _connection_tracker: Arc<ServiceConnectionTracker>,
+    // Guard that holds the connection slot - kept alive for the lifetime of the control channel
+    _connection_guard: Option<ConnectionGuard>,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -403,6 +593,10 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        connection_tracker: Arc<ServiceConnectionTracker>,
+        connection_guard: Option<ConnectionGuard>,
+        control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+        service_digest: ServiceDigest,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -468,6 +662,8 @@ where
             shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval,
+            control_channels: control_channels.clone(),
+            service_digest,
         };
 
         // Run the control channel
@@ -484,19 +680,23 @@ where
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
             service,
+            _connection_tracker: connection_tracker,
+            _connection_guard: connection_guard,
         }
     }
 }
 
 // Control channel, using T as the transport layer. P is TcpStream or UdpTraffic
-struct ControlChannel<T: Transport> {
+struct ControlChannel<T: Transport + 'static> {
     conn: T::Stream,                               // The connection of control channel
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    control_channels: Arc<RwLock<ControlChannelMap<T>>>, // Map to remove handle from on shutdown
+    service_digest: ServiceDigest,                 // Service digest for lookup
 }
 
-impl<T: Transport> ControlChannel<T> {
+impl<T: Transport + 'static> ControlChannel<T> {
     async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
         write_and_flush(&mut self.conn, data)
             .await
@@ -540,7 +740,25 @@ impl<T: Transport> ControlChannel<T> {
 
         info!("Control channel shutdown");
 
+        // Cleanup will happen in Drop implementation
         Ok(())
+    }
+}
+
+impl<T: Transport + 'static> Drop for ControlChannel<T> {
+    fn drop(&mut self) {
+        // Remove the handle from control_channels map asynchronously
+        // This will trigger ConnectionGuard::drop which frees the slot
+        let control_channels = self.control_channels.clone();
+        let service_digest = self.service_digest;
+        
+        tokio::spawn(async move {
+            let mut map = control_channels.write().await;
+            if map.remove1(&service_digest).is_none() {
+                // Only log if something unexpected happens
+                debug!("Control channel handle already removed from map");
+            }
+        });
     }
 }
 

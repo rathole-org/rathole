@@ -100,7 +100,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 socket2 = { version = "0.4", features = ["all"] }
 fdlimit = "0.2"
-async-trait = "0.1"
 snowstorm = { version = "0.4", optional = true, features = [
     "stream",
 ], default-features = false }

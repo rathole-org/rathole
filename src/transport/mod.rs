@@ -1,8 +1,8 @@
 use crate::config::{ClientServiceConfig, ServerServiceConfig, TcpConfig, TransportConfig};
 use crate::helper::{to_socket_addr, try_set_tcp_keepalive};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use std::fmt::{Debug, Display};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -49,7 +49,6 @@ impl Display for AddrMaybeCached {
 }
 
 /// Specify a transport layer, like TCP, TLS
-#[async_trait]
 pub trait Transport: Debug + Send + Sync {
     type Acceptor: Send + Sync;
     type RawStream: Send + Sync;
@@ -64,7 +63,7 @@ pub trait Transport: Debug + Send + Sync {
     /// accept must be cancel safe
     async fn accept(&self, a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)>;
     async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream>;
-    async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream>;
+    fn connect(&self, addr: &AddrMaybeCached) -> impl Future<Output = Result<Self::Stream>> + Send;
 }
 
 mod tcp;

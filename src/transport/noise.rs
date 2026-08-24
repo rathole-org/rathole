@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use super::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use crate::config::{NoiseConfig, TransportConfig};
 use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
 use snowstorm::{Builder, NoiseParams, NoiseStream};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
@@ -22,7 +21,7 @@ impl std::fmt::Debug for NoiseTransport {
 }
 
 impl NoiseTransport {
-    fn builder(&self) -> Builder {
+    fn builder(&self) -> Builder<'_> {
         let builder = Builder::new(self.params.clone()).local_private_key(&self.local_private_key);
         match &self.remote_public_key {
             Some(x) => builder.remote_public_key(x),
@@ -31,7 +30,6 @@ impl NoiseTransport {
     }
 }
 
-#[async_trait]
 impl Transport for NoiseTransport {
     type Acceptor = TcpListener;
     type RawStream = TcpStream;
@@ -102,6 +100,6 @@ impl Transport for NoiseTransport {
         let conn = NoiseStream::handshake(conn, self.builder().build_initiator()?)
             .await
             .with_context(|| "Failed to do noise handshake")?;
-        return Ok(conn);
+        Ok(conn)
     }
 }

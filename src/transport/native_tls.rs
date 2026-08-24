@@ -2,7 +2,6 @@ use crate::config::{TlsConfig, TransportConfig};
 use crate::helper::host_port_pair;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
 use std::fs;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -18,7 +17,6 @@ pub struct TlsTransport {
     tls_acceptor: Option<TlsAcceptor>,
 }
 
-#[async_trait]
 impl Transport for TlsTransport {
     type Acceptor = TcpListener;
     type RawStream = TcpStream;

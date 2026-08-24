@@ -174,6 +174,11 @@ nodelay = true # Optional. Same as the client
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"
+
+[server.services.service3]
+type = "udp"
+bind_addr = "0.0.0.0:8083"
+udp_data_channels = 4 # Optional. The number of data channels of a UDP service. Visitors are load balanced among the data channels by their addresses. Only valid for UDP services. Default: 1
 ```
 
 ### Logging

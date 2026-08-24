@@ -104,6 +104,7 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
+    pub udp_data_channels: Option<usize>,
 }
 
 impl ServerServiceConfig {
@@ -263,6 +264,20 @@ impl Config {
                 s.token = server.default_token.clone();
                 if s.token.is_none() {
                     bail!("The token of service {} is not set", name);
+                }
+            }
+            if let Some(n) = s.udp_data_channels {
+                if s.service_type != ServiceType::Udp {
+                    bail!(
+                        "`udp_data_channels` of service {} is only valid for UDP services",
+                        name
+                    );
+                }
+                if n == 0 {
+                    bail!(
+                        "`udp_data_channels` of service {} must be greater than 0",
+                        name
+                    );
                 }
             }
         }

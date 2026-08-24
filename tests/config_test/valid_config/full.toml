@@ -44,5 +44,10 @@ type = "tcp" # Optional. Same as the client `[client.services.X.type]
 token = "whatever" # Necesary if `server.default_token` not set
 bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change. 
 
-[server.services.service2] 
+[server.services.service2]
 bind_addr = "0.0.0.1:8082"
+
+[server.services.service3]
+type = "udp"
+bind_addr = "0.0.0.0:8083"
+udp_data_channels = 4 # Optional. The number of data channels of a UDP service. Visitors are load balanced among the data channels by their addresses. Only valid for UDP services. Default: 1

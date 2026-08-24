@@ -19,9 +19,10 @@ default_token = "default_token_if_not_specify"
 [server.transport]
 type = "tcp" 
 
-[server.services.echo] 
+[server.services.echo]
 type = "udp"
-bind_addr = "0.0.0.0:2334" 
-[server.services.pingpong] 
+bind_addr = "0.0.0.0:2334"
+udp_data_channels = 4
+[server.services.pingpong]
 type = "udp"
-bind_addr = "0.0.0.0:2335" 
+bind_addr = "0.0.0.0:2335"

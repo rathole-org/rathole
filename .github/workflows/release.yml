@@ -41,30 +41,6 @@ jobs:
             target: armv7-unknown-linux-musleabihf
             exe: rathole
             cross: true
-          - os: ubuntu-latest
-            target: mips-unknown-linux-gnu
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: mips-unknown-linux-musl
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: mipsel-unknown-linux-gnu
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: mipsel-unknown-linux-musl
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: mips64-unknown-linux-gnuabi64
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: mips64el-unknown-linux-gnuabi64
-            exe: rathole
-            cross: true
 
           - os: macos-latest
             target: x86_64-apple-darwin
@@ -88,8 +64,11 @@ jobs:
           default: true
       
       - name: Install OpenSSL
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-latest' && !contains(matrix.target, 'musl')
         run: sudo apt-get install pkg-config libssl-dev
+      - name: Install Musl Tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get install musl-tools
       - name: Install OpenSSL
         if: matrix.os == 'macos-latest'
         run: brew install openssl@3

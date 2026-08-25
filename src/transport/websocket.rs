@@ -7,7 +7,6 @@ use std::task::{ready, Context, Poll};
 use super::{AddrMaybeCached, SocketOpts, TcpTransport, TlsTransport, Transport};
 use crate::config::TransportConfig;
 use anyhow::anyhow;
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::stream::Stream;
 use futures_sink::Sink;
@@ -182,7 +181,6 @@ pub struct WebsocketTransport {
     conf: WebSocketConfig,
 }
 
-#[async_trait]
 impl Transport for WebsocketTransport {
     type Acceptor = TcpListener;
     type RawStream = TcpStream;

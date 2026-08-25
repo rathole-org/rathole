@@ -5,7 +5,6 @@ use crate::{
 
 use super::{AddrMaybeCached, SocketOpts, Transport};
 use anyhow::Result;
-use async_trait::async_trait;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
@@ -15,7 +14,6 @@ pub struct TcpTransport {
     cfg: TcpConfig,
 }
 
-#[async_trait]
 impl Transport for TcpTransport {
     type Acceptor = TcpListener;
     type Stream = TcpStream;

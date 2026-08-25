@@ -9,7 +9,6 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
 
 use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
 use p12::PFX;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 pub(crate) use tokio_rustls::TlsStream;
@@ -81,7 +80,6 @@ fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
     ))
 }
 
-#[async_trait]
 impl Transport for TlsTransport {
     type Acceptor = TcpListener;
     type RawStream = TcpStream;

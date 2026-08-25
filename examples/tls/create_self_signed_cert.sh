@@ -51,6 +51,7 @@ EOF
 openssl x509 -req \
     -in server.csr \
     -CA rootCA.crt -CAkey rootCA.key \
+    -CAcreateserial \
     -out server.crt \
     -days 365 \
     -sha256 -extfile cert.conf

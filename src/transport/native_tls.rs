@@ -51,14 +51,18 @@ impl Transport for TlsTransport {
 
         let tls_acceptor = match config.pkcs12.as_ref() {
             Some(path) => {
+                let password = config
+                    .pkcs12_password
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Missing `tls.pkcs12_password`"))?;
                 let ident = Identity::from_pkcs12(
-                    &fs::read(path)?,
-                    config.pkcs12_password.as_ref().unwrap(),
+                    &fs::read(path).with_context(|| "Failed to read the `tls.pkcs12` file")?,
+                    password,
                 )
-                .with_context(|| "Failed to create identitiy")?;
-                Some(TlsAcceptor::from(
-                    native_tls::TlsAcceptor::new(ident).unwrap(),
-                ))
+                .with_context(|| "Failed to create identity from `tls.pkcs12`")?;
+                let acceptor = native_tls::TlsAcceptor::new(ident)
+                    .with_context(|| "Failed to create TLS acceptor")?;
+                Some(TlsAcceptor::from(acceptor))
             }
             None => None,
         };

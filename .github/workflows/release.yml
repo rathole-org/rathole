@@ -81,11 +81,11 @@ jobs:
             exe: rathole.exe
             cross: false
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           profile: minimal
-          default: true
+      - uses: Swatinem/rust-cache@v2
       
       - name: Install OpenSSL
         if: matrix.os == 'ubuntu-latest'
@@ -170,10 +170,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: release
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           profile: minimal
+      - uses: Swatinem/rust-cache@v2
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}

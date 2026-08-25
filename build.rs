@@ -1,18 +1,35 @@
 use anyhow::Result;
-use vergen::{vergen, Config, SemverKind};
+use vergen::{BuildBuilder, CargoBuilder, Emitter, RustcBuilder, SysinfoBuilder};
+use vergen_gitcl::GitclBuilder;
 
 fn main() -> Result<()> {
-    let mut config = Config::default();
-    // Change the SEMVER output to the lightweight variant
-    *config.git_mut().semver_kind_mut() = SemverKind::Lightweight;
-    // Add a `-dirty` flag to the SEMVER output
-    *config.git_mut().semver_dirty_mut() = Some("-dirty");
-    // Generate the instructions
-    if let Err(e) = vergen(config) {
+    let build = BuildBuilder::all_build()?;
+    let cargo = CargoBuilder::all_cargo()?;
+    let rustc = RustcBuilder::all_rustc()?;
+    let si = SysinfoBuilder::all_sysinfo()?;
+
+    let mut git = GitclBuilder::default();
+    git.describe(false, true, Some("-dirty"))
+        .sha(false)
+        .commit_timestamp(true)
+        .branch(true);
+    let git = git.build()?;
+
+    if let Err(e) = Emitter::default()
+        .add_instructions(&build)?
+        .add_instructions(&cargo)?
+        .add_instructions(&rustc)?
+        .add_instructions(&si)?
+        .add_instructions(&git)?
+        .emit()
+    {
         eprintln!("error occurred while generating instructions: {:?}", e);
-        let mut config = Config::default();
-        *config.git_mut().enabled_mut() = false;
-        vergen(config)
+        Emitter::default()
+            .add_instructions(&build)?
+            .add_instructions(&cargo)?
+            .add_instructions(&rustc)?
+            .add_instructions(&si)?
+            .emit()
     } else {
         Ok(())
     }

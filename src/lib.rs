@@ -13,6 +13,8 @@ pub use config::Config;
 pub use constants::UDP_BUFFER_SIZE;
 
 use anyhow::Result;
+#[cfg(feature = "noise")]
+use base64::Engine;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info};
 
@@ -28,8 +30,10 @@ use server::run_server;
 
 use crate::config_watcher::{ConfigChange, ConfigWatcherHandle};
 
+#[cfg(feature = "noise")]
 const DEFAULT_CURVE: KeypairType = KeypairType::X25519;
 
+#[cfg(feature = "noise")]
 fn get_str_from_keypair_type(curve: KeypairType) -> &'static str {
     match curve {
         KeypairType::X25519 => "25519",
@@ -49,19 +53,25 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
     );
     let keypair = builder.generate_keypair()?;
 
-    println!("Private Key:\n{}\n", base64::encode(keypair.private));
-    println!("Public Key:\n{}", base64::encode(keypair.public));
+    println!(
+        "Private Key:\n{}\n",
+        base64::engine::general_purpose::STANDARD.encode(keypair.private)
+    );
+    println!(
+        "Public Key:\n{}",
+        base64::engine::general_purpose::STANDARD.encode(keypair.public)
+    );
     Ok(())
 }
 
 #[cfg(not(feature = "noise"))]
-fn genkey(curve: Option<KeypairType>) -> Result<()> {
+fn genkey(_curve: Option<KeypairType>) -> Result<()> {
     crate::helper::feature_not_compile("nosie")
 }
 
 pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    if args.genkey.is_some() {
-        return genkey(args.genkey.unwrap());
+    if let Some(curve) = args.genkey {
+        return genkey(Some(curve));
     }
 
     // Raise `nofile` limit on linux and mac

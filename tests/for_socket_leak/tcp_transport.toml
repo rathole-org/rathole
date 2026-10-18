@@ -1,0 +1,29 @@
+[client]
+remote_addr = "127.0.0.1:3343"
+default_token = "default_token_if_not_specify"
+post_half_close_idle_timeout = 1 # 1s keeps the 5s stuck-peer assertion fast
+
+[client.transport]
+type = "tcp"
+
+[client.services.delayed_response]
+type = "socket_stream"
+local_addr = "/tmp/rathole_leak_test/delayed_response.sock"
+[client.services.sinkhole]
+type = "socket_stream"
+local_addr = "/tmp/rathole_leak_test/sinkhole.sock"
+
+[server]
+bind_addr = "0.0.0.0:3343"
+default_token = "default_token_if_not_specify"
+post_half_close_idle_timeout = 1 # 1s keeps the 5s stuck-peer assertion fast
+
+[server.transport]
+type = "tcp"
+
+[server.services.delayed_response]
+type = "socket_stream"
+bind_addr = "/tmp/rathole_leak_test/delayed_response_exposed.sock"
+[server.services.sinkhole]
+type = "socket_stream"
+bind_addr = "/tmp/rathole_leak_test/sinkhole_exposed.sock"

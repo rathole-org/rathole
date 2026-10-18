@@ -1,6 +1,7 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
+use crate::forward::{forward_bidirectional, ForwardOpts};
 use crate::helper::{generate_proxy_protocol_header, retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
@@ -18,7 +19,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
@@ -44,6 +45,21 @@ const SOCKET_STREAM_POOL_SIZE: usize = 8; // The number of cached connections fo
 
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+
+// Surface the outcome of a forwarder task. Only the leak-guard reaper
+// (the typed `PostHalfCloseIdleTimeout` sentinel) is debug-level; generic
+// `TimedOut` from a transport could indicate a real handshake / keepalive
+// problem and stays at warn.
+fn log_forwarder_outcome(kind: &'static str, e: &io::Error) {
+    if crate::forward::is_post_half_close_idle_timeout(e) {
+        debug!(
+            "Forwarder ({}) reaped by post-half-close idle timeout",
+            kind
+        );
+    } else {
+        warn!("Forwarder ({}) ended with error: {}", kind, e);
+    }
+}
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -359,6 +375,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             conn,
             service_config,
             server_config.heartbeat_interval,
+            server_config.forward_opts(),
             Arc::downgrade(&control_channels),
             session_key,
         );
@@ -415,6 +432,7 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        forward_opts: ForwardOpts,
         control_channels: Weak<RwLock<ControlChannelMap<T>>>,
         session_key: Nonce,
     ) -> ControlChannelHandle<T> {
@@ -457,6 +475,7 @@ where
                     if let Err(e) = run_tcp_connection_pool::<T>(
                         bind_addr,
                         proxy_protocol.clone(),
+                        forward_opts,
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
@@ -490,6 +509,7 @@ where
                 async move {
                     if let Err(e) = run_socket_stream_connection_pool::<T>(
                         bind_addr,
+                        forward_opts,
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
@@ -786,6 +806,7 @@ fn socket_stream_listen_and_send(
 async fn run_tcp_connection_pool<T: Transport>(
     bind_addr: String,
     proxy_protocol: String,
+    forward_opts: ForwardOpts,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -793,16 +814,16 @@ async fn run_tcp_connection_pool<T: Transport>(
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
-    'pool: while let Some(mut visitor) = visitor_rx.recv().await {
+    'pool: while let Some(visitor) = visitor_rx.recv().await {
+        let mut visitor = Some(visitor);
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                    let v = visitor.take().unwrap();
                     let proxy_proto = proxy_protocol.clone();
                     tokio::spawn(async move {
                         if !proxy_proto.is_empty() {
-                            let proxy_proto_header =
-                                generate_proxy_protocol_header(&visitor, &proxy_proto);
-                            match proxy_proto_header {
+                            match generate_proxy_protocol_header(&v, &proxy_proto) {
                                 Ok(header) => {
                                     let _ = ch.write_all(&header).await;
                                     let _ = ch.flush().await;
@@ -812,16 +833,24 @@ async fn run_tcp_connection_pool<T: Transport>(
                                 }
                             }
                         }
-                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                        if let Err(e) = forward_bidirectional(ch, v, forward_opts).await {
+                            log_forwarder_outcome("tcp", &e);
+                        }
                     });
                     break;
                 } else {
-                    // Current data channel is broken. Request for a new one
+                    // Current data channel is broken. Request for a new one.
                     if data_ch_req_tx.send(true).is_err() {
+                        if let Some(mut v) = visitor.take() {
+                            let _ = AsyncWriteExt::shutdown(&mut v).await;
+                        }
                         break 'pool;
                     }
                 }
             } else {
+                if let Some(mut v) = visitor.take() {
+                    let _ = AsyncWriteExt::shutdown(&mut v).await;
+                }
                 break 'pool;
             }
         }
@@ -835,6 +864,7 @@ async fn run_tcp_connection_pool<T: Transport>(
 #[instrument(skip_all)]
 async fn run_socket_stream_connection_pool<T: Transport>(
     bind_addr: String,
+    forward_opts: ForwardOpts,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -843,21 +873,31 @@ async fn run_socket_stream_connection_pool<T: Transport>(
         socket_stream_listen_and_send(bind_addr, _data_ch_req_tx.clone(), shutdown_rx);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardSocketStream).unwrap();
 
-    'pool: while let Some(mut visitor) = visitor_rx.recv().await {
+    'pool: while let Some(visitor) = visitor_rx.recv().await {
+        let mut visitor = Some(visitor);
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                    let v = visitor.take().unwrap();
                     tokio::spawn(async move {
-                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                        if let Err(e) = forward_bidirectional(ch, v, forward_opts).await {
+                            log_forwarder_outcome("socket_stream", &e);
+                        }
                     });
                     break;
                 } else {
-                    // Current data channel is broken. Request for a new one
+                    // Current data channel is broken. Request for a new one.
                     if _data_ch_req_tx.send(true).is_err() {
+                        if let Some(mut v) = visitor.take() {
+                            let _ = AsyncWriteExt::shutdown(&mut v).await;
+                        }
                         break 'pool;
                     }
                 }
             } else {
+                if let Some(mut v) = visitor.take() {
+                    let _ = AsyncWriteExt::shutdown(&mut v).await;
+                }
                 break 'pool;
             }
         }
@@ -1025,6 +1065,7 @@ mod tests {
                 server_conn,
                 tcp_service(service_addr),
                 0,
+                ForwardOpts::default(),
                 Arc::downgrade(&control_channels),
                 session_key,
             );
@@ -1060,6 +1101,7 @@ mod tests {
                 server_conn,
                 tcp_service(service_addr),
                 0,
+                ForwardOpts::default(),
                 Arc::downgrade(&control_channels),
                 session_key,
             );

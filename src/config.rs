@@ -3,11 +3,13 @@ use serde::de::IntoDeserializer;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::path::Path;
 use tokio::fs;
 use url::Url;
 
+use crate::forward::{ForwardOpts, DEFAULT_FORWARD_BUFFER_SIZE};
 use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
 
 /// Application-layer heartbeat interval in secs
@@ -238,6 +240,104 @@ fn default_client_retry_interval() -> u64 {
     DEFAULT_CLIENT_RETRY_INTERVAL_SECS
 }
 
+/// Opt-in post-half-close idle timeout for the TCP / `socket_stream`
+/// forwarders. Accepts a non-negative integer (seconds) or the string
+/// `"off"`. Unset (the default) and `"off"` both leave the timeout disabled,
+/// which is the legacy `copy_bidirectional` behavior; `120` is a reasonable
+/// value when the leak guard is wanted.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub struct PostHalfCloseIdleTimeout(pub Option<u64>);
+
+impl PostHalfCloseIdleTimeout {
+    pub fn as_duration(&self) -> Option<std::time::Duration> {
+        self.0.map(std::time::Duration::from_secs)
+    }
+}
+
+impl Serialize for PostHalfCloseIdleTimeout {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Some(v) => s.serialize_u64(v),
+            None => s.serialize_str("off"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PostHalfCloseIdleTimeout {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = PostHalfCloseIdleTimeout;
+
+            fn expecting(&self, f: &mut Formatter) -> std::fmt::Result {
+                f.write_str(r#"a non-negative integer (seconds) or the string "off""#)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(PostHalfCloseIdleTimeout(Some(v)))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v < 0 {
+                    Err(E::custom("post_half_close_idle_timeout must be >= 0"))
+                } else {
+                    Ok(PostHalfCloseIdleTimeout(Some(v as u64)))
+                }
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.eq_ignore_ascii_case("off") {
+                    Ok(PostHalfCloseIdleTimeout(None))
+                } else {
+                    Err(E::custom(format!(
+                        r#"expected non-negative integer or "off", got {:?}"#,
+                        v
+                    )))
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Per-direction buffer size of a forwarder, in bytes. Each forwarded TCP /
+/// `socket_stream` connection holds two. Defaults to tokio's
+/// `copy_bidirectional` size (8 KiB); zero is rejected at parse time.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(try_from = "usize", into = "usize")]
+pub struct ForwardBufferSize(NonZeroUsize);
+
+impl ForwardBufferSize {
+    pub fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl Default for ForwardBufferSize {
+    fn default() -> Self {
+        ForwardBufferSize(
+            NonZeroUsize::new(DEFAULT_FORWARD_BUFFER_SIZE)
+                .expect("default buffer size is non-zero"),
+        )
+    }
+}
+
+impl TryFrom<usize> for ForwardBufferSize {
+    type Error = String;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        NonZeroUsize::new(value)
+            .map(ForwardBufferSize)
+            .ok_or_else(|| String::from("forward_buffer_size must be greater than 0"))
+    }
+}
+
+impl From<ForwardBufferSize> for usize {
+    fn from(value: ForwardBufferSize) -> usize {
+        value.get()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
@@ -251,6 +351,20 @@ pub struct ClientConfig {
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
     pub retry_interval: u64,
+    #[serde(default)]
+    pub post_half_close_idle_timeout: PostHalfCloseIdleTimeout,
+    #[serde(default)]
+    pub forward_buffer_size: ForwardBufferSize,
+}
+
+impl ClientConfig {
+    /// Forwarder tuning shared by every data channel of this client.
+    pub(crate) fn forward_opts(&self) -> ForwardOpts {
+        ForwardOpts {
+            post_half_close_idle_timeout: self.post_half_close_idle_timeout.as_duration(),
+            buffer_size: self.forward_buffer_size.get(),
+        }
+    }
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -267,6 +381,20 @@ pub struct ServerConfig {
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+    #[serde(default)]
+    pub post_half_close_idle_timeout: PostHalfCloseIdleTimeout,
+    #[serde(default)]
+    pub forward_buffer_size: ForwardBufferSize,
+}
+
+impl ServerConfig {
+    /// Forwarder tuning shared by every service's connection pool.
+    pub(crate) fn forward_opts(&self) -> ForwardOpts {
+        ForwardOpts {
+            post_half_close_idle_timeout: self.post_half_close_idle_timeout.as_duration(),
+            buffer_size: self.forward_buffer_size.get(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -590,5 +718,137 @@ mod tests {
             "4"
         );
         Ok(())
+    }
+
+    #[test]
+    fn post_half_close_idle_timeout_roundtrip() {
+        // Default: the leak guard is opt-in, so programmatic Default and the
+        // serde missing-field default must both be "off".
+        assert_eq!(PostHalfCloseIdleTimeout::default().0, None);
+
+        let parsed: ClientConfig = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+[services]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.post_half_close_idle_timeout.0, None,
+            "missing field must leave the timeout off"
+        );
+
+        // Numeric value.
+        let parsed: ClientConfig = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+post_half_close_idle_timeout = 30
+[services]
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.post_half_close_idle_timeout.0, Some(30));
+
+        // Zero is valid (immediate teardown after half-close).
+        let parsed: ClientConfig = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+post_half_close_idle_timeout = 0
+[services]
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.post_half_close_idle_timeout.0, Some(0));
+
+        // "off" disables the timeout entirely.
+        let parsed: ClientConfig = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+post_half_close_idle_timeout = "off"
+[services]
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.post_half_close_idle_timeout.0, None);
+
+        // Negative is rejected.
+        let err: Result<ClientConfig, _> = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+post_half_close_idle_timeout = -1
+[services]
+"#,
+        );
+        assert!(err.is_err(), "negative must be rejected");
+
+        // Arbitrary string is rejected.
+        let err: Result<ClientConfig, _> = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+post_half_close_idle_timeout = "later"
+[services]
+"#,
+        );
+        assert!(err.is_err(), "unknown string must be rejected");
+    }
+
+    #[test]
+    fn forward_buffer_size_roundtrip() {
+        // Programmatic Default and serde missing-field default agree on
+        // tokio's `copy_bidirectional` size.
+        assert_eq!(ForwardBufferSize::default().get(), 8 * 1024);
+
+        let parsed: ServerConfig = toml::from_str(
+            r#"
+bind_addr = "0.0.0.0:1"
+default_token = "t"
+[services]
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.forward_buffer_size.get(), 8 * 1024);
+        assert_eq!(parsed.forward_opts(), ForwardOpts::default());
+
+        // Explicit value flows into the forwarder options together with the
+        // idle timeout.
+        let parsed: ClientConfig = toml::from_str(
+            r#"
+remote_addr = "x:1"
+default_token = "t"
+post_half_close_idle_timeout = 30
+forward_buffer_size = 4096
+[services]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.forward_opts(),
+            ForwardOpts {
+                post_half_close_idle_timeout: Some(std::time::Duration::from_secs(30)),
+                buffer_size: 4096,
+            }
+        );
+
+        // Zero and negative values are rejected at parse time.
+        for value in ["0", "-1"] {
+            let err: Result<ClientConfig, _> = toml::from_str(&format!(
+                r#"
+remote_addr = "x:1"
+default_token = "t"
+forward_buffer_size = {value}
+[services]
+"#
+            ));
+            assert!(
+                err.is_err(),
+                "forward_buffer_size = {value} must be rejected"
+            );
+        }
     }
 }

@@ -123,6 +123,13 @@ jobs:
           cargo test --locked --target ${{ matrix.target }} --test integration_test
           --no-default-features
           --features server,client,rustls,noise,websocket-rustls,hot-reload
+      - name: Forwarder regression tests with native-tls
+        run: cargo test --locked --target ${{ matrix.target }} --test leak_test
+      - name: Forwarder regression tests with rustls
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} --test leak_test
+          --no-default-features
+          --features server,client,rustls,noise,websocket-rustls,hot-reload
 
   required:
     name: Required checks

@@ -1,5 +1,6 @@
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
+use crate::forward::{forward_bidirectional, ForwardOpts};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
@@ -15,7 +16,7 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
@@ -83,6 +84,21 @@ pub async fn run_client(
 type ServiceDigest = protocol::Digest;
 type Nonce = protocol::Digest;
 
+// Surface the outcome of a forwarder task. Only the leak-guard reaper
+// (the typed `PostHalfCloseIdleTimeout` sentinel) is debug-level; generic
+// `TimedOut` from a transport could indicate a real handshake / keepalive
+// problem and stays at warn.
+fn log_forwarder_outcome(kind: &'static str, e: &io::Error) {
+    if crate::forward::is_post_half_close_idle_timeout(e) {
+        debug!(
+            "Forwarder ({}) reaped by post-half-close idle timeout",
+            kind
+        );
+    } else {
+        warn!("Forwarder ({}) ended with error: {}", kind, e);
+    }
+}
+
 // Holds the state of a client
 struct Client<T: Transport> {
     config: ClientConfig,
@@ -117,6 +133,7 @@ impl<T: 'static + Transport> Client<T> {
                 self.config.remote_addr.clone(),
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
+                self.config.forward_opts(),
             );
             self.service_handles.insert(name.clone(), handle);
         }
@@ -159,6 +176,7 @@ impl<T: 'static + Transport> Client<T> {
                         self.config.remote_addr.clone(),
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
+                        self.config.forward_opts(),
                     );
                     let _ = self.service_handles.insert(name, handle);
                 }
@@ -177,6 +195,7 @@ struct RunDataChannelArgs<T: Transport> {
     connector: Arc<T>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
+    forward_opts: ForwardOpts,
 }
 
 async fn do_data_channel_handshake<T: Transport>(
@@ -226,7 +245,8 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            run_data_channel_for_tcp::<T>(conn, &args.service.local_addr).await?;
+            run_data_channel_for_tcp::<T>(conn, &args.service.local_addr, args.forward_opts)
+                .await?;
         }
         DataChannelCmd::StartForwardUdp => {
             if args.service.service_type != ServiceType::Udp {
@@ -240,23 +260,31 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::SocketStream {
                 bail!("Expect SocketStream traffic. Please check the configuration.")
             }
-            run_data_channel_for_socket_stream::<T>(conn, &args.service.local_addr).await?;
+            run_data_channel_for_socket_stream::<T>(
+                conn,
+                &args.service.local_addr,
+                args.forward_opts,
+            )
+            .await?;
         }
     }
     Ok(())
 }
 
-// Simply copying back and forth for TCP
+// Two-phase bidirectional forwarding for TCP. See `crate::forward`.
 #[instrument(skip(conn))]
 async fn run_data_channel_for_tcp<T: Transport>(
-    mut conn: T::Stream,
+    conn: T::Stream,
     local_addr: &str,
+    forward_opts: ForwardOpts,
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
-    let mut local = TcpStream::connect(local_addr)
+    let local = TcpStream::connect(local_addr)
         .await
         .with_context(|| format!("Failed to connect to {}", local_addr))?;
-    let _ = copy_bidirectional(&mut conn, &mut local).await;
+    if let Err(e) = forward_bidirectional(conn, local, forward_opts).await {
+        log_forwarder_outcome("tcp", &e);
+    }
     Ok(())
 }
 
@@ -351,15 +379,18 @@ async fn run_data_channel_for_udp<T: Transport>(
 
 #[cfg(unix)]
 async fn run_data_channel_for_socket_stream<T: Transport>(
-    mut conn: T::Stream,
+    conn: T::Stream,
     local_addr: &str,
+    forward_opts: ForwardOpts,
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
 
-    let mut local = UnixStream::connect(local_addr)
+    let local = UnixStream::connect(local_addr)
         .await
         .with_context(|| format!("Failed to connect to {}", local_addr))?;
-    let _ = copy_bidirectional(&mut conn, &mut local).await;
+    if let Err(e) = forward_bidirectional(conn, local, forward_opts).await {
+        log_forwarder_outcome("socket_stream", &e);
+    }
     Ok(())
 }
 
@@ -424,6 +455,7 @@ struct ControlChannel<T: Transport> {
     remote_addr: String,                // `client.remote_addr`
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
+    forward_opts: ForwardOpts,
 }
 
 // Handle of a control channel
@@ -493,6 +525,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             connector: self.transport.clone(),
             socket_opts,
             service: self.service.clone(),
+            forward_opts: self.forward_opts,
         });
 
         loop {
@@ -533,6 +566,7 @@ impl ControlChannelHandle {
         remote_addr: String,
         transport: Arc<T>,
         heartbeat_timeout: u64,
+        forward_opts: ForwardOpts,
     ) -> ControlChannelHandle {
         let digest = protocol::digest(service.name.as_bytes());
 
@@ -548,6 +582,7 @@ impl ControlChannelHandle {
             remote_addr,
             transport,
             heartbeat_timeout,
+            forward_opts,
         };
 
         tokio::spawn(

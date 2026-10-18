@@ -23,3 +23,15 @@ with `--nocapture` to see the retained directory path:
 RATHOLE_TEST_KEEP_CERTS=1 cargo test --test integration_test \
   common::tls::tests::generates_and_cleans_up_tls_artifacts -- --exact --nocapture
 ```
+
+## Forwarder regression tests
+
+`tests/leak_test.rs` covers the two-phase forwarder behind
+`post_half_close_idle_timeout`: half-close-then-respond compatibility and
+stuck-peer cleanup, across every enabled transport plus a Unix socket variant.
+It uses the same 60-second scenario deadline and generated TLS artifacts as the
+integration tests and runs as its own target:
+
+```sh
+cargo test --test leak_test
+```

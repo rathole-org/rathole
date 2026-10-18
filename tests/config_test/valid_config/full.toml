@@ -1,6 +1,8 @@
 [client]
 remote_addr = "example.com:2333" # Necessary. The address of the server
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
+post_half_close_idle_timeout = 120 # Optional. Opt-in idle deadline (seconds) after one peer half-closes. Default: off
+forward_buffer_size = 8192 # Optional. Per-direction forwarder buffer size in bytes. Default: 8192
 
 [client.transport]
 type = "tcp" # Optional. Possible values: ["tcp", "tls"]. Default: "tcp"
@@ -26,6 +28,8 @@ local_addr = "127.0.0.1:1082"
 [server]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change. 
 default_token = "default_token_if_not_specify" # Optional
+post_half_close_idle_timeout = 120 # Optional. Opt-in idle deadline (seconds) after one peer half-closes. Default: off
+forward_buffer_size = 8192 # Optional. Per-direction forwarder buffer size in bytes. Default: 8192
 
 [server.transport]
 type = "tcp" # Same as `[client.transport]`

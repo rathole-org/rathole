@@ -109,6 +109,8 @@ remote_addr = "example.com:2333" # Necessary. The address of the server
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
 heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
+post_half_close_idle_timeout = 120 # Optional. Opt-in idle deadline (seconds) applied to a forwarder once one peer has half-closed; see the dedicated section below. Unset or `"off"` keeps the legacy behavior. Default: off
+forward_buffer_size = 8192 # Optional. Per-direction buffer size in bytes for each forwarded TCP / socket_stream connection (two buffers per connection). See the dedicated section below. Default: 8192
 
 [client.transport] # The whole block is optional. Specify which transport to use
 type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise"]. Default: "tcp"
@@ -145,6 +147,8 @@ local_addr = "127.0.0.1:1082"
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+post_half_close_idle_timeout = 120 # Optional. Opt-in idle deadline (seconds) applied to a forwarder once one peer has half-closed; see the dedicated section below. Unset or `"off"` keeps the legacy behavior. Default: off
+forward_buffer_size = 8192 # Optional. Per-direction buffer size in bytes for each forwarded TCP / socket_stream connection (two buffers per connection). See the dedicated section below. Default: 8192
 
 [server.transport] # Same as `[client.transport]`
 type = "tcp"
@@ -197,6 +201,31 @@ If `RUST_LOG` is not present, the default logging level is `info`.
 From v0.4.7, rathole enables TCP_NODELAY by default, which should benefit the latency and interactive applications like rdp, Minecraft servers. However, it slightly decreases the bandwidth.
 
 If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false`.
+
+### `post_half_close_idle_timeout`
+
+When a forwarded peer sends `FIN` (half-closes its write side) but never closes its own read side, the underlying socket can sit indefinitely in `CLOSE-WAIT` / `FIN-WAIT-2`. Over time these orphaned sockets accumulate. The `post_half_close_idle_timeout` option is an opt-in leak guard for that pattern.
+
+**How it arms.** While both directions of a forwarder are still carrying bytes, no timeout applies — long-lived idle full-duplex connections (SSH, MQTT keepalive, long-poll) are unaffected. The deadline only arms once one direction has reached EOF and that EOF has been propagated as `shutdown(SHUT_WR)` to the peer's write side. From that point on, the surviving direction must read at least one byte (or hit EOF / error) within the configured window, otherwise the forwarder is reaped and both ends are torn down.
+
+**Per-step deadline.** The deadline is checked at every read, write and flush — not just reads — so a peer that half-closes and then stops draining its read side cannot wedge the forwarder inside `write_all` via TCP backpressure.
+
+**Configuration.**
+- Set on `[client]` and `[server]` blocks at top level. Hot-reload of these top-level fields restarts the running instance; service-level edits remain incremental.
+- Accepts a non-negative integer (seconds) or the string `"off"` (disables the timeout entirely; legacy `copy_bidirectional` behavior).
+- Off by default: when the option is not set (or set to `"off"`) forwarding behaves exactly as it did before this option existed. `120` seconds is a reasonable value when enabling the leak guard.
+- `0` is allowed and means "tear down immediately on half-close" — useful for protocols that never half-close legitimately.
+
+**Per-transport behavior.**
+- `tcp`, `tls`, `noise`: full half-close-then-respond preserved. The leak guard only arms the timeout after the surviving direction enters its post-EOF idle phase. One exception: with the `native-tls` backend on Windows (SChannel), close_notify closes the whole TLS session, so a peer cannot respond after the other side half-closes; `rustls` and OpenSSL-based `native-tls` do not have this limitation. This matches the previous `copy_bidirectional` behavior.
+- `socket_stream` (Unix domain sockets): same as TCP.
+- `websocket`, `websocket` (TLS): WebSocket cannot carry a half-close-then-respond pattern — RFC 6455 requires the receiver of a Close frame to reply with its own Close, which closes its sending side too. The timeout still bounds cleanup but cannot change the protocol's full-close semantics.
+
+**Observability.** Every reap is logged at debug level with the message `Forwarder (...) reaped by post-half-close idle timeout`. To verify the leak guard is firing in production, run with `RUST_LOG=rathole=debug` and grep for that line.
+
+### `forward_buffer_size`
+
+Every forwarded TCP or `socket_stream` connection holds two buffers, one per direction, of `forward_buffer_size` bytes each. The default of `8192` bytes equals tokio's `copy_bidirectional` buffer that rathole used before, so the per-connection footprint is unchanged unless the option is set. On memory-constrained devices with many concurrent connections it can be lowered (for example to `2048`) at some throughput cost; on high-bandwidth links a larger value (for example `65536`) reduces per-chunk overhead. The option sits at the top level of `[client]` and `[server]`, must be greater than `0`, and, like other top-level fields, changing it on hot-reload restarts the running instance.
 
 ## Benchmark
 

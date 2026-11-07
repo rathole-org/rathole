@@ -3,7 +3,8 @@ use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, Tran
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
 use crate::helper::{
-    constant_time_eq, generate_proxy_protocol_header, retry_notify_with_deadline, write_and_flush,
+    constant_time_eq, generate_proxy_protocol_header, log_ip, retry_notify_with_deadline,
+    set_log_ips, write_and_flush,
 };
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
@@ -136,6 +137,7 @@ fn generate_service_hashmap(
 impl<T: 'static + Transport> Server<T> {
     // Create a server from `[server]`
     pub async fn from(config: ServerConfig) -> Result<Server<T>> {
+        set_log_ips(config.log_ips);
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
@@ -204,7 +206,7 @@ impl<T: 'static + Transport> Server<T> {
 
                             // Refuse throttled sources before spending a transport handshake on them
                             if self.throttle.is_blocked(addr.ip()) {
-                                debug!(%addr, "Dropping connection from a throttled source");
+                                debug!(addr = %log_ip(addr), "Dropping connection from a throttled source");
                                 continue;
                             }
 
@@ -219,7 +221,7 @@ impl<T: 'static + Transport> Server<T> {
                                         if let Err(err) = handle_connection(conn, addr, services, control_channels, server_config, &throttle).await {
                                             note_handshake_failure(&throttle, addr, &err);
                                         }
-                                    }.instrument(info_span!("connection", %addr)));
+                                    }.instrument(info_span!("connection", addr = %log_ip(addr))));
                                 }
                                 Ok(Err(e)) => {
                                     note_handshake_failure(&self.throttle, addr, &e.context("Failed to do transport handshake"));
@@ -273,20 +275,19 @@ impl<T: 'static + Transport> Server<T> {
     }
 }
 
-// Handle connections to `server.bind_addr`
 /// Log a failed handshake and count it against the source. Logging stops once
 /// the source is banned, so a scanner produces a bounded number of lines.
 fn note_handshake_failure(throttle: &AuthThrottle, addr: SocketAddr, err: &anyhow::Error) {
     match throttle.record_failure(addr.ip()) {
-        Failure::Counted(_) => warn!(%addr, "{:#}", err),
+        Failure::Counted(_) => warn!(addr = %log_ip(addr), "{:#}", err),
         Failure::Banned => warn!(
-            %addr,
+            addr = %log_ip(addr),
             "{:#}. Refusing {} for {}s after repeated failed handshakes",
             err,
-            SourceKey::from_ip(addr.ip()),
+            log_ip(SourceKey::from_ip(addr.ip())),
             throttle.ban_duration().as_secs()
         ),
-        Failure::AlreadyBanned => debug!(%addr, "{:#}", err),
+        Failure::AlreadyBanned => debug!(addr = %log_ip(addr), "{:#}", err),
     }
 }
 
@@ -301,6 +302,7 @@ async fn read_with_deadline<F: std::future::Future<Output = Result<R>>, R>(
         .map_err(|_| anyhow!("Timed out waiting for {}", what))?
 }
 
+// Handle connections to `server.bind_addr`
 async fn handle_connection<T: 'static + Transport>(
     mut conn: T::Stream,
     addr: SocketAddr,
@@ -726,7 +728,7 @@ fn tcp_listen_and_send(
 
                             backoff.reset();
 
-                            debug!("New visitor from {}", addr);
+                            debug!("New visitor from {}", log_ip(addr));
 
                             // Send the visitor to the connection pool
                             let _ = tx.send(incoming).await;

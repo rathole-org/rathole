@@ -145,6 +145,7 @@ default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
 auth_fail_limit = 10 # Optional. Failed handshakes from one source (an IPv4 address or IPv6 /64) within a minute before it is refused. Set to 0 to disable. Default: 10
 auth_ban_secs = 300 # Optional. How long a source that hit `auth_fail_limit` is refused, in seconds. Default: 300
+log_ips = true # Optional. Whether logs show the IP addresses of clients and visitors. When false they appear as `<redacted>`. Default: true
 
 [server.transport] # Same as `[client.transport]`
 type = "tcp"

@@ -274,6 +274,14 @@ pub struct ServerConfig {
     /// How long a throttled source is refused, in seconds
     #[serde(default = "default_auth_ban_secs")]
     pub auth_ban_secs: u64,
+    /// Whether logs show the IP addresses of clients and visitors. When false
+    /// they appear as `<redacted>`.
+    #[serde(default = "default_log_ips")]
+    pub log_ips: bool,
+}
+
+fn default_log_ips() -> bool {
+    true
 }
 
 fn default_auth_fail_limit() -> u32 {

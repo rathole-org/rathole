@@ -480,3 +480,54 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
     std::hint::black_box(diff) == 0
 }
+
+static LOG_IPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Set whether `log_ip` shows peer addresses (`server.log_ips`)
+pub fn set_log_ips(on: bool) {
+    LOG_IPS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A peer address (or anything derived from one) as it should appear in logs
+pub struct LoggedIp<T> {
+    value: T,
+    show: bool,
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for LoggedIp<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.show {
+            self.value.fmt(f)
+        } else {
+            f.write_str("<redacted>")
+        }
+    }
+}
+
+/// Wrap a peer address for logging, so `server.log_ips = false` hides it
+pub fn log_ip<T: std::fmt::Display>(value: T) -> LoggedIp<T> {
+    LoggedIp {
+        value,
+        show: LOG_IPS.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+mod log_ip_tests {
+    use super::LoggedIp;
+
+    #[test]
+    fn hides_or_shows_the_address() {
+        let addr: std::net::SocketAddr = "192.0.2.7:4242".parse().unwrap();
+        let shown = LoggedIp {
+            value: addr,
+            show: true,
+        };
+        let hidden = LoggedIp {
+            value: addr,
+            show: false,
+        };
+        assert_eq!(shown.to_string(), "192.0.2.7:4242");
+        assert_eq!(hidden.to_string(), "<redacted>");
+    }
+}

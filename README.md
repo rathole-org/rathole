@@ -165,6 +165,7 @@ pkcs12_password = "password" # Necessary. Password of the pkcs12 file
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
 local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
+remote_public_keys = ["key_encoded_in_base64"] # Optional. More client public keys allowed to connect, added to `remote_public_key`. Only for patterns that authenticate the client, e.g. KK, XK, IK. See docs/transport.md
 
 [server.transport.websocket] # Necessary if `type` is "websocket"
 tls = true # If `true` then it will use settings in `server.transport.tls`

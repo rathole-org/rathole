@@ -173,7 +173,12 @@ pub struct NoiseConfig {
     #[serde(default = "default_noise_pattern")]
     pub pattern: String,
     pub local_private_key: Option<MaskedString>,
+    /// Client: the server's public key. Server: a client public key allowed to
+    /// connect (the only one, unless `remote_public_keys` adds more).
     pub remote_public_key: Option<String>,
+    /// Server only: more client public keys allowed to connect, for patterns
+    /// that authenticate the client (`K`, `X` or `I` first letter, e.g. KK, XK, IK)
+    pub remote_public_keys: Option<Vec<String>>,
     // TODO: Maybe psk can be added
 }
 

@@ -139,6 +139,20 @@ local_private_key = "client-priv-key-here"
 remote_public_key = "server-pub-key-here"
 ```
 
+### Several Authenticated Clients
+
+A server can allow more than one client key with `remote_public_keys`, which adds to `remote_public_key`. Each client keeps its own keypair and its usual single `remote_public_key` (the server's), and a client whose key isn't listed can't complete the handshake.
+
+```toml
+# Server Side Configuration
+[server.transport.noise]
+pattern = "Noise_KK_25519_ChaChaPoly_BLAKE2s"
+local_private_key = "server-priv-key-here"
+remote_public_keys = ["client-a-pub-key", "client-b-pub-key"]
+```
+
+With KK the server tries each listed key against the client's first handshake message, so each extra key costs a little CPU per handshake. With patterns where the client sends its key (`XK`, `IK`, `XX`), the server checks the key it receives against the list instead. Any listed key works for every service, so the service tokens still decide which client can serve which service. Patterns starting with `N` don't authenticate clients, so a server refuses `remote_public_keys` with them.
+
 ### Other Patterns
 
 To find out which pattern to use, refer to:

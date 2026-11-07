@@ -33,25 +33,34 @@ Aruguments are:
 - `-in`: Server Certificate
 - `-certfile`: CA Certificate
 
-Creating self-signed certificate with one's own CA is a non-trival task. However, a script is provided under tls example folder for reference.
+Creating a self-signed certificate with one's own CA is a non-trivial task. The
+TLS example includes a script that generates the required files locally (they
+are intentionally not committed):
+
+```sh
+./examples/tls/create_self_signed_cert.sh
+```
 
 ### Rustls Support
 
-`rathole` provides optional `rustls` support. [Build Guide](build-guide.md) demostrated this.
+`rathole` provides optional `rustls` support. See the [build guide](build-guide.md).
 
-One difference is that, the crate we use for loading PKCS#12 archives can only handle limited types of PBE algorithms. We only support PKCS#12 archives that they (crate `p12`) support. So we need to specify the legacy format (openssl 1.x format) when creating the PKCS#12 archive.
-
-In short, the command used with openssl 3 to create the PKCS#12 archive with `rustls` support is:
+The `rustls` backend uses the `p12` crate to load PKCS#12 archives and supports
+legacy PBE algorithms. With OpenSSL 3, explicitly use 3DES for both the key and
+certificate bags to create an identity that works with both TLS backends:
 
 ```sh
-openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile ca_chain_certs.crt -legacy
+openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt \
+  -certfile ca_chain_certs.crt -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
 ```
+
+The provided example script creates this compatible format automatically.
 
 ## Noise Protocol
 
-### Quickstart for the Noise Protocl
+### Quickstart for the Noise Protocol
 
-In one word, the [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweigt, easy to configure and drop-in replacement of TLS. No need to create a self-sign certificate to secure the connection.
+In one word, the [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweight, easy to configure and drop-in replacement of TLS. No need to create a self-sign certificate to secure the connection.
 
 `rathole` comes with a reasonable default configuration for noise protocol. You can a glimpse of the minimal [example](../examples/noise_nk) for how it will look like.
 
@@ -129,6 +138,20 @@ pattern = "Noise_KK_25519_ChaChaPoly_BLAKE2s"
 local_private_key = "client-priv-key-here"
 remote_public_key = "server-pub-key-here"
 ```
+
+### Several Authenticated Clients
+
+A server can allow more than one client key with `remote_public_keys`, which adds to `remote_public_key`. Each client keeps its own keypair and its usual single `remote_public_key` (the server's), and a client whose key isn't listed can't complete the handshake.
+
+```toml
+# Server Side Configuration
+[server.transport.noise]
+pattern = "Noise_KK_25519_ChaChaPoly_BLAKE2s"
+local_private_key = "server-priv-key-here"
+remote_public_keys = ["client-a-pub-key", "client-b-pub-key"]
+```
+
+With KK the server tries each listed key against the client's first handshake message, so each extra key costs a little CPU per handshake. With patterns where the client sends its key (`XK`, `IK`, `XX`), the server checks the key it receives against the list instead. Any listed key works for every service, so the service tokens still decide which client can serve which service. Patterns starting with `N` don't authenticate clients, so a server refuses `remote_public_keys` with them.
 
 ### Other Patterns
 

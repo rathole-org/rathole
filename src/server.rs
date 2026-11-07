@@ -1,27 +1,36 @@
+use crate::auth_throttle::{AuthThrottle, Failure, SourceKey};
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
-use crate::helper::{retry_notify_with_deadline, write_and_flush};
+use crate::helper::{
+    constant_time_eq, generate_proxy_protocol_header, log_ip, retry_notify_with_deadline,
+    set_log_ips, write_and_flush,
+};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
     HASH_WIDTH_IN_BYTES,
 };
-use crate::transport::{SocketOpts, TcpTransport, Transport};
+use crate::transport::{SocketOpts, TcpTransport, Transport, TransportRole};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
+
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
@@ -35,8 +44,15 @@ type Nonce = protocol::Digest; // Also called `session_key`
 
 const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
 const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
+#[cfg(unix)]
+const SOCKET_STREAM_POOL_SIZE: usize = 8; // The number of cached connections for SocketStream services
+
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+                                  // Timeout for each read of the rathole handshake (hello, auth) that follows it
+const PROTO_READ_TIMEOUT: Duration = Duration::from_secs(10);
+// Window in which `auth_fail_limit` failures get a source banned
+const AUTH_FAIL_WINDOW: Duration = Duration::from_secs(60);
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -103,6 +119,8 @@ struct Server<T: Transport> {
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     // Wrapper around the transport layer
     transport: Arc<T>,
+    // Failed-handshake counts per source
+    throttle: Arc<AuthThrottle>,
 }
 
 // Generate a hash map of services which is indexed by ServiceDigest
@@ -119,15 +137,22 @@ fn generate_service_hashmap(
 impl<T: 'static + Transport> Server<T> {
     // Create a server from `[server]`
     pub async fn from(config: ServerConfig) -> Result<Server<T>> {
+        set_log_ips(config.log_ips);
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
-        let transport = Arc::new(T::new(&config.transport)?);
+        let transport = Arc::new(T::new(&config.transport, TransportRole::Server)?);
+        let throttle = Arc::new(AuthThrottle::new(
+            config.auth_fail_limit,
+            AUTH_FAIL_WINDOW,
+            Duration::from_secs(config.auth_ban_secs),
+        ));
         Ok(Server {
             config,
             services,
             control_channels,
             transport,
+            throttle,
         })
     }
 
@@ -179,26 +204,30 @@ impl<T: 'static + Transport> Server<T> {
                         Ok((conn, addr)) => {
                             backoff.reset();
 
+                            // Refuse throttled sources before spending a transport handshake on them
+                            if self.throttle.is_blocked(addr.ip()) {
+                                debug!(addr = %log_ip(addr), "Dropping connection from a throttled source");
+                                continue;
+                            }
+
                             // Do transport handshake with a timeout
                             match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
-                                Ok(conn) => {
-                                    match conn.with_context(|| "Failed to do transport handshake") {
-                                        Ok(conn) => {
-                                            let services = self.services.clone();
-                                            let control_channels = self.control_channels.clone();
-                                            let server_config = self.config.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
-                                                    error!("{:#}", err);
-                                                }
-                                            }.instrument(info_span!("connection", %addr)));
-                                        }, Err(e) => {
-                                            error!("{:#}", e);
+                                Ok(Ok(conn)) => {
+                                    let services = self.services.clone();
+                                    let control_channels = self.control_channels.clone();
+                                    let server_config = self.config.clone();
+                                    let throttle = self.throttle.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) = handle_connection(conn, addr, services, control_channels, server_config, &throttle).await {
+                                            note_handshake_failure(&throttle, addr, &err);
                                         }
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Transport handshake timeout: {}", e);
+                                    }.instrument(info_span!("connection", addr = %log_ip(addr))));
+                                }
+                                Ok(Err(e)) => {
+                                    note_handshake_failure(&self.throttle, addr, &e.context("Failed to do transport handshake"));
+                                }
+                                Err(_) => {
+                                    note_handshake_failure(&self.throttle, addr, &anyhow!("Transport handshake timeout"));
                                 }
                             }
                         }
@@ -246,15 +275,44 @@ impl<T: 'static + Transport> Server<T> {
     }
 }
 
+/// Log a failed handshake and count it against the source. Logging stops once
+/// the source is banned, so a scanner produces a bounded number of lines.
+fn note_handshake_failure(throttle: &AuthThrottle, addr: SocketAddr, err: &anyhow::Error) {
+    match throttle.record_failure(addr.ip()) {
+        Failure::Counted(_) => warn!(addr = %log_ip(addr), "{:#}", err),
+        Failure::Banned => warn!(
+            addr = %log_ip(addr),
+            "{:#}. Refusing {} for {}s after repeated failed handshakes",
+            err,
+            log_ip(SourceKey::from_ip(addr.ip())),
+            throttle.ban_duration().as_secs()
+        ),
+        Failure::AlreadyBanned => debug!(addr = %log_ip(addr), "{:#}", err),
+    }
+}
+
+/// Read one handshake message, giving up after `PROTO_READ_TIMEOUT` so idle
+/// connections can't pile up between the transport handshake and auth
+async fn read_with_deadline<F: std::future::Future<Output = Result<R>>, R>(
+    what: &str,
+    f: F,
+) -> Result<R> {
+    time::timeout(PROTO_READ_TIMEOUT, f)
+        .await
+        .map_err(|_| anyhow!("Timed out waiting for {}", what))?
+}
+
 // Handle connections to `server.bind_addr`
 async fn handle_connection<T: 'static + Transport>(
     mut conn: T::Stream,
+    addr: SocketAddr,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
+    throttle: &AuthThrottle,
 ) -> Result<()> {
     // Read hello
-    let hello = read_hello(&mut conn).await?;
+    let hello = read_with_deadline("hello", read_hello(&mut conn)).await?;
     match hello {
         ControlChannelHello(_, service_digest) => {
             do_control_channel_handshake(
@@ -265,6 +323,7 @@ async fn handle_connection<T: 'static + Transport>(
                 server_config,
             )
             .await?;
+            throttle.record_success(addr.ip());
         }
         DataChannelHello(_, nonce) => {
             do_data_channel_handshake(conn, control_channels, nonce).await?;
@@ -297,16 +356,23 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         .await?;
     conn.flush().await?;
 
+    // Read auth before revealing anything about the service: an unknown service
+    // gets the same reply as a wrong token, so service names can't be enumerated
+    let protocol::Auth(d) = read_with_deadline("auth", read_auth(&mut conn)).await?;
+
     // Lookup the service
     let service_config = match services.read().await.get(&service_digest) {
-        Some(v) => v,
+        Some(v) => v.to_owned(),
         None => {
-            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
+            conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
                 .await?;
-            bail!("No such a service {}", hex::encode(service_digest));
+            conn.flush().await?;
+            bail!(
+                "Control channel for unknown service {} refused",
+                hex::encode(service_digest)
+            );
         }
-    }
-    .to_owned();
+    };
 
     let service_name = &service_config.name;
 
@@ -314,19 +380,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
     concat.append(&mut nonce);
 
-    // Read auth
-    let protocol::Auth(d) = read_auth(&mut conn).await?;
-
     // Validate
     let session_key = protocol::digest(&concat);
-    if session_key != d {
+    if !constant_time_eq(&session_key, &d) {
         conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
             .await?;
-        debug!(
-            "Expect {}, but got {}",
-            hex::encode(session_key),
-            hex::encode(d)
-        );
+        conn.flush().await?;
         bail!("Service {} failed the authentication", service_name);
     } else {
         let mut h = control_channels.write().await;
@@ -348,8 +407,13 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+        let handle = ControlChannelHandle::new(
+            conn,
+            service_config,
+            server_config.heartbeat_interval,
+            Arc::downgrade(&control_channels),
+            session_key,
+        );
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -379,6 +443,9 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
                 .with_context(|| "Data channel for a stale control channel")?;
         }
         None => {
+            // Not counted against the source: a legitimate client can race a
+            // restart or hot reload with stale nonces, and a 32-byte nonce
+            // can't be guessed anyway
             warn!("Data channel has incorrect nonce");
         }
     }
@@ -403,6 +470,8 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        control_channels: Weak<RwLock<ControlChannelMap<T>>>,
+        session_key: Nonce,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -417,6 +486,8 @@ where
         let pool_size = match service.service_type {
             ServiceType::Tcp => TCP_POOL_SIZE,
             ServiceType::Udp => UDP_POOL_SIZE,
+            #[cfg(unix)]
+            ServiceType::SocketStream => SOCKET_STREAM_POOL_SIZE,
         };
 
         for _i in 0..pool_size {
@@ -427,11 +498,20 @@ where
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
+        let proxy_protocol = service.proxy_protocol.clone().unwrap_or_default();
+        if proxy_protocol == "v1" || proxy_protocol == "v2" {
+            info!("Proxy protocol {:?} is enabled", proxy_protocol);
+        } else if proxy_protocol.is_empty() {
+            info!("Proxy protocol is disabled");
+        } else {
+            error!("Unknown proxy protocol {}", proxy_protocol);
+        }
         match service.service_type {
             ServiceType::Tcp => tokio::spawn(
                 async move {
                     if let Err(e) = run_tcp_connection_pool::<T>(
                         bind_addr,
+                        proxy_protocol.clone(),
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
@@ -460,6 +540,23 @@ where
                 }
                 .instrument(Span::current()),
             ),
+            #[cfg(unix)]
+            ServiceType::SocketStream => tokio::spawn(
+                async move {
+                    if let Err(e) = run_socket_stream_connection_pool::<T>(
+                        bind_addr,
+                        data_ch_rx,
+                        data_ch_req_tx,
+                        shutdown_rx_clone,
+                    )
+                    .await
+                    .with_context(|| "Failed to run SocketStream connection pool")
+                    {
+                        error!("{:#}", e);
+                    }
+                }
+                .instrument(Span::current()),
+            ),
         };
 
         // Create the control channel
@@ -470,11 +567,16 @@ where
             heartbeat_interval,
         };
 
-        // Run the control channel
+        // On exit, drop the handle so `shutdown_tx` drops and the data channel pool
+        // closes; otherwise its sockets leak. session_key is unique, so this never
+        // removes a reconnected session.
         tokio::spawn(
             async move {
                 if let Err(err) = ch.run().await {
                     error!("{:#}", err);
+                }
+                if let Some(control_channels) = control_channels.upgrade() {
+                    control_channels.write().await.remove2(&session_key);
                 }
             }
             .instrument(Span::current()),
@@ -497,25 +599,48 @@ struct ControlChannel<T: Transport> {
 }
 
 impl<T: Transport> ControlChannel<T> {
-    async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
-        write_and_flush(&mut self.conn, data)
-            .await
-            .with_context(|| "Failed to write control cmds")?;
-        Ok(())
-    }
     // Run a control channel
     #[instrument(skip_all)]
-    async fn run(mut self) -> Result<()> {
+    async fn run(self) -> Result<()> {
         let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
         let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
+
+        // Split so we can read (to detect a dead client) and write concurrently.
+        let ControlChannel {
+            conn,
+            mut shutdown_rx,
+            mut data_ch_req_rx,
+            heartbeat_interval,
+        } = self;
+        let (mut rd, mut wr) = tokio::io::split(conn);
+        let mut probe = [0u8; 1];
 
         // Wait for data channel requests and the shutdown signal
         loop {
             tokio::select! {
-                val = self.data_ch_req_rx.recv() => {
+                // The client sends nothing after the handshake, so any completed
+                // read means it's gone. Heartbeat writes alone never notice a
+                // half-closed client, which leaks its sockets.
+                res = rd.read(&mut probe) => {
+                    match res {
+                        Ok(0) => {
+                            debug!("Control channel closed by the client");
+                            break;
+                        }
+                        Ok(bytes_read) => {
+                            warn!(bytes_read, "Unexpected data on control channel");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Control channel read error: {:#}", e);
+                            break;
+                        }
+                    }
+                },
+                val = data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
-                            if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
+                            if let Err(e) = write_and_flush(&mut wr, &create_ch_cmd).await {
                                 error!("{:#}", e);
                                 break;
                             }
@@ -525,14 +650,14 @@ impl<T: Transport> ControlChannel<T> {
                         }
                     }
                 },
-                _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
-                            if let Err(e) = self.write_and_flush(&heartbeat).await {
+                _ = time::sleep(Duration::from_secs(heartbeat_interval)), if heartbeat_interval != 0 => {
+                            if let Err(e) = write_and_flush(&mut wr, &heartbeat).await {
                                 error!("{:#}", e);
                                 break;
                             }
                 }
                 // Wait for the shutdown signal
-                _ = self.shutdown_rx.recv() => {
+                _ = shutdown_rx.recv() => {
                     break;
                 }
             }
@@ -603,7 +728,7 @@ fn tcp_listen_and_send(
 
                             backoff.reset();
 
-                            debug!("New visitor from {}", addr);
+                            debug!("New visitor from {}", log_ip(addr));
 
                             // Send the visitor to the connection pool
                             let _ = tx.send(incoming).await;
@@ -622,9 +747,100 @@ fn tcp_listen_and_send(
     rx
 }
 
+#[cfg(unix)]
+fn socket_stream_listen_and_send(
+    addr: String,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) -> mpsc::Receiver<UnixStream> {
+    let (tx, rx) = mpsc::channel(CHAN_SIZE);
+
+    tokio::spawn(async move {
+        let l = retry_notify_with_deadline(listen_backoff(),  || async {
+            if let Ok(exists) = Path::new(&addr).try_exists() {
+                if exists {
+                    std::fs::remove_file(&addr).unwrap_or_else(|_| error!("Failed to delete stale socket file {}", &addr));
+                };
+            };
+            Ok(UnixListener::bind(&addr)?)
+        }, |e, duration| {
+            error!("{:#}. Retry in {:?}", e, duration);
+        }, &mut shutdown_rx).await
+        .with_context(|| "Failed to listen for the service");
+
+        let l: UnixListener = match l {
+            Ok(v) => v,
+            Err(e) => {
+                error!("{:#}", e);
+                return;
+            }
+        };
+
+        info!("Listening at {}", &addr);
+
+        // Retry at least every 1s
+        let mut backoff = ExponentialBackoff {
+            max_interval: Duration::from_secs(1),
+            max_elapsed_time: None,
+            ..Default::default()
+        };
+
+        // Wait for visitors and the shutdown signal
+        loop {
+            tokio::select! {
+                val = l.accept() => {
+                    match val {
+                        Err(e) => {
+                            // `l` is a Socket listener so this must be a IO error
+                            // Possibly a EMFILE. So sleep for a while
+                            error!("{}. Sleep for a while", e);
+                            if let Some(d) = backoff.next_backoff() {
+                                time::sleep(d).await;
+                            } else {
+                                // This branch will never be reached for current backoff policy
+                                error!("Too many retries. Aborting...");
+                                break;
+                            }
+                        }
+                        Ok((incoming, addr)) => {
+                            // For every visitor, request to create a data channel
+                            if data_ch_req_tx.send(true).with_context(|| "Failed to send data channel create request").is_err() {
+                                // An error indicates the control channel is broken
+                                // So break the loop
+                                break;
+                            }
+
+                            backoff.reset();
+
+                            debug!("New visitor from {:?}", addr);
+
+                            // Send the visitor to the connection pool
+                            let _ = tx.send(incoming).await;
+                        }
+                    }
+                },
+                _ = shutdown_rx.recv() => {
+                    // cleanup the socket file for SocketStream service
+                    if let Ok(exists) = Path::new(&addr).try_exists() {
+                        if exists {
+                            std::fs::remove_file(&addr).unwrap_or_else(|_| error!("Failed to delete socket file {}", &addr));
+                        };
+                    };
+                    break;
+                }
+            }
+        }
+
+        info!("SocketStreamListener shutdown");
+    }.instrument(Span::current()));
+
+    rx
+}
+
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<T: Transport>(
     bind_addr: String,
+    proxy_protocol: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -636,13 +852,63 @@ async fn run_tcp_connection_pool<T: Transport>(
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                    let proxy_proto = proxy_protocol.clone();
                     tokio::spawn(async move {
+                        if !proxy_proto.is_empty() {
+                            let proxy_proto_header =
+                                generate_proxy_protocol_header(&visitor, &proxy_proto);
+                            match proxy_proto_header {
+                                Ok(header) => {
+                                    let _ = ch.write_all(&header).await;
+                                    let _ = ch.flush().await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to generate proxy protocol header: {}", e);
+                                }
+                            }
+                        }
                         let _ = copy_bidirectional(&mut ch, &mut visitor).await;
                     });
                     break;
                 } else {
                     // Current data channel is broken. Request for a new one
                     if data_ch_req_tx.send(true).is_err() {
+                        break 'pool;
+                    }
+                }
+            } else {
+                break 'pool;
+            }
+        }
+    }
+
+    info!("Shutdown");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[instrument(skip_all)]
+async fn run_socket_stream_connection_pool<T: Transport>(
+    bind_addr: String,
+    mut data_ch_rx: mpsc::Receiver<T::Stream>,
+    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    let mut visitor_rx =
+        socket_stream_listen_and_send(bind_addr, _data_ch_req_tx.clone(), shutdown_rx);
+    let cmd = bincode::serialize(&DataChannelCmd::StartForwardSocketStream).unwrap();
+
+    'pool: while let Some(mut visitor) = visitor_rx.recv().await {
+        loop {
+            if let Some(mut ch) = data_ch_rx.recv().await {
+                if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                    tokio::spawn(async move {
+                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                    });
+                    break;
+                } else {
+                    // Current data channel is broken. Request for a new one
+                    if _data_ch_req_tx.send(true).is_err() {
                         break 'pool;
                     }
                 }
@@ -711,4 +977,160 @@ async fn run_udp_connection_pool<T: Transport>(
     debug!("UDP pool dropped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+    use std::net::SocketAddr;
+
+    const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn unused_tcp_addr() -> Result<SocketAddr> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        Ok(listener.local_addr()?)
+    }
+
+    async fn connected_tcp_pair() -> Result<(TcpStream, TcpStream)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (client, (server, _)) = tokio::try_join!(TcpStream::connect(addr), listener.accept())?;
+        Ok((server, client))
+    }
+
+    async fn wait_until_listener_is_bound(addr: SocketAddr) -> Result<()> {
+        time::timeout(CLEANUP_TIMEOUT, async {
+            loop {
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => {
+                        drop(listener);
+                        time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) if error.kind() == ErrorKind::AddrInUse => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        })
+        .await
+        .context("service listener was not created before the deadline")?
+    }
+
+    async fn wait_until_listener_is_released(addr: SocketAddr) -> Result<TcpListener> {
+        time::timeout(CLEANUP_TIMEOUT, async {
+            loop {
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => return Ok(listener),
+                    Err(error) if error.kind() == ErrorKind::AddrInUse => {
+                        time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        })
+        .await
+        .context("service listener was not released before the deadline")?
+    }
+
+    async fn wait_until_channel_is_removed(
+        control_channels: &RwLock<ControlChannelMap<TcpTransport>>,
+        service_digest: ServiceDigest,
+        session_key: Nonce,
+    ) -> Result<()> {
+        time::timeout(CLEANUP_TIMEOUT, async {
+            loop {
+                let removed = {
+                    let channels = control_channels.read().await;
+                    channels.get1(&service_digest).is_none()
+                        && channels.get2(&session_key).is_none()
+                };
+                if removed {
+                    return;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("control channel was not removed before the deadline")?;
+        Ok(())
+    }
+
+    fn tcp_service(bind_addr: SocketAddr) -> ServerServiceConfig {
+        ServerServiceConfig {
+            service_type: ServiceType::Tcp,
+            name: "cleanup-test".to_owned(),
+            bind_addr: bind_addr.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn half_closed_control_channel_releases_map_entry_and_listener_without_heartbeat(
+    ) -> Result<()> {
+        let service_addr = unused_tcp_addr()?;
+        let (server_conn, mut client_conn) = connected_tcp_pair().await?;
+        let service_digest = [1_u8; HASH_WIDTH_IN_BYTES];
+        let session_key = [2_u8; HASH_WIDTH_IN_BYTES];
+        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+
+        {
+            // Match the handshake's locking order so cleanup cannot run before insertion.
+            let mut channels = control_channels.write().await;
+            let handle = ControlChannelHandle::<TcpTransport>::new(
+                server_conn,
+                tcp_service(service_addr),
+                0,
+                Arc::downgrade(&control_channels),
+                session_key,
+            );
+            if channels
+                .insert(service_digest, session_key, handle)
+                .is_err()
+            {
+                bail!("failed to insert test control channel");
+            }
+        }
+
+        wait_until_listener_is_bound(service_addr).await?;
+        client_conn.shutdown().await?;
+
+        wait_until_channel_is_removed(&control_channels, service_digest, session_key).await?;
+        let released_listener = wait_until_listener_is_released(service_addr).await?;
+        drop(released_listener);
+        drop(client_conn);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_channel_map_releases_listener_without_retaining_cycle() -> Result<()> {
+        let service_addr = unused_tcp_addr()?;
+        let (server_conn, _client_conn) = connected_tcp_pair().await?;
+        let service_digest = [3_u8; HASH_WIDTH_IN_BYTES];
+        let session_key = [4_u8; HASH_WIDTH_IN_BYTES];
+        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+
+        {
+            let mut channels = control_channels.write().await;
+            let handle = ControlChannelHandle::<TcpTransport>::new(
+                server_conn,
+                tcp_service(service_addr),
+                0,
+                Arc::downgrade(&control_channels),
+                session_key,
+            );
+            if channels
+                .insert(service_digest, session_key, handle)
+                .is_err()
+            {
+                bail!("failed to insert test control channel");
+            }
+        }
+
+        wait_until_listener_is_bound(service_addr).await?;
+        drop(control_channels);
+
+        let released_listener = wait_until_listener_is_released(service_addr).await?;
+        drop(released_listener);
+        Ok(())
+    }
 }

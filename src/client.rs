@@ -6,7 +6,7 @@ use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
     DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
 };
-use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
+use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport, TransportRole};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
@@ -15,11 +15,14 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
+
+#[cfg(unix)]
+use tokio::net::UnixStream;
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
@@ -90,8 +93,10 @@ struct Client<T: Transport> {
 impl<T: 'static + Transport> Client<T> {
     // Create a Client from `[client]` config block
     async fn from(config: ClientConfig) -> Result<Client<T>> {
-        let transport =
-            Arc::new(T::new(&config.transport).with_context(|| "Failed to create the transport")?);
+        let transport = Arc::new(
+            T::new(&config.transport, TransportRole::Client)
+                .with_context(|| "Failed to create the transport")?,
+        );
         Ok(Client {
             config,
             service_handles: HashMap::new(),
@@ -191,7 +196,7 @@ async fn do_data_channel_handshake<T: Transport>(
             args.connector
                 .connect(&args.remote_addr)
                 .await
-                .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
+                .with_context(|| format!("Failed to connect to {}", args.remote_addr))
                 .map_err(backoff::Error::transient)
         },
         |e, duration| {
@@ -227,7 +232,15 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
+                .await?;
+        }
+        #[cfg(unix)]
+        DataChannelCmd::StartForwardSocketStream => {
+            if args.service.service_type != ServiceType::SocketStream {
+                bail!("Expect SocketStream traffic. Please check the configuration.")
+            }
+            run_data_channel_for_socket_stream::<T>(conn, &args.service.local_addr).await?;
         }
     }
     Ok(())
@@ -240,7 +253,6 @@ async fn run_data_channel_for_tcp<T: Transport>(
     local_addr: &str,
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
-
     let mut local = TcpStream::connect(local_addr)
         .await
         .with_context(|| format!("Failed to connect to {}", local_addr))?;
@@ -255,7 +267,11 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    mut conn: T::Stream,
+    local_addr: &str,
+    prefer_ipv6: bool,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -263,72 +279,88 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
     // The channel stores UdpTraffic that needs to be sent to the server
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<UdpTraffic>(UDP_SENDQ_SIZE);
 
-    // FIXME: https://github.com/tokio-rs/tls/issues/40
-    // Maybe this is our concern
-    let (mut rd, mut wr) = io::split(conn);
-
-    // Keep sending items from the outbound channel to the server
-    tokio::spawn(async move {
-        while let Some(t) = outbound_rx.recv().await {
-            trace!("outbound {:?}", t);
-            if let Err(e) = t
-                .write(&mut wr)
-                .await
-                .with_context(|| "Failed to forward UDP traffic to the server")
-            {
-                debug!("{:?}", e);
-                break;
-            }
-        }
-    });
-
+    // Read from and write to `conn` from a single task, alternating via `select!`,
+    // instead of splitting it and using it from two tasks concurrently.
+    // TLS streams aren't guaranteed to be full-duplex safe for concurrent
+    // reads/writes from independent tasks: https://github.com/tokio-rs/tls/issues/40
     loop {
-        // Read a packet from the server
-        let hdr_len = rd.read_u8().await?;
-        let packet = UdpTraffic::read(&mut rd, hdr_len)
-            .await
-            .with_context(|| "Failed to read UDPTraffic from the server")?;
-        let m = port_map.read().await;
-
-        if m.get(&packet.from).is_none() {
-            // This packet is from a address we don't see for a while,
-            // which is not in the UdpPortMap.
-            // So set up a mapping (and a forwarder) for it
-
-            // Drop the reader lock
-            drop(m);
-
-            // Grab the writer lock
-            // This is the only thread that will try to grab the writer lock
-            // So no need to worry about some other thread has already set up
-            // the mapping between the gap of dropping the reader lock and
-            // grabbing the writer lock
-            let mut m = port_map.write().await;
-
-            match udp_connect(local_addr, prefer_ipv6).await {
-                Ok(s) => {
-                    let (inbound_tx, inbound_rx) = mpsc::channel(UDP_SENDQ_SIZE);
-                    m.insert(packet.from, inbound_tx);
-                    tokio::spawn(run_udp_forwarder(
-                        s,
-                        inbound_rx,
-                        outbound_tx.clone(),
-                        packet.from,
-                        port_map.clone(),
-                    ));
-                }
-                Err(e) => {
-                    error!("{:#}", e);
+        tokio::select! {
+            t = outbound_rx.recv() => {
+                match t {
+                    Some(t) => {
+                        trace!("outbound {:?}", t);
+                        t.write(&mut conn)
+                            .await
+                            .with_context(|| "Failed to forward UDP traffic to the server")?;
+                    }
+                    None => break,
                 }
             }
-        }
 
-        // Now there should be a udp forwarder that can receive the packet
-        let m = port_map.read().await;
-        if let Some(tx) = m.get(&packet.from) {
-            let _ = tx.send(packet.data).await;
+            hdr_len = conn.read_u8() => {
+                // Read a packet from the server
+                let packet = UdpTraffic::read(&mut conn, hdr_len?)
+                    .await
+                    .with_context(|| "Failed to read UDPTraffic from the server")?;
+                let m = port_map.read().await;
+
+                if m.get(&packet.from).is_none() {
+                    // This packet is from a address we don't see for a while,
+                    // which is not in the UdpPortMap.
+                    // So set up a mapping (and a forwarder) for it
+
+                    // Drop the reader lock
+                    drop(m);
+
+                    // Grab the writer lock
+                    // This is the only thread that will try to grab the writer lock
+                    // So no need to worry about some other thread has already set up
+                    // the mapping between the gap of dropping the reader lock and
+                    // grabbing the writer lock
+                    let mut m = port_map.write().await;
+
+                    match udp_connect(local_addr, prefer_ipv6).await {
+                        Ok(s) => {
+                            let (inbound_tx, inbound_rx) = mpsc::channel(UDP_SENDQ_SIZE);
+                            m.insert(packet.from, inbound_tx);
+                            tokio::spawn(run_udp_forwarder(
+                                s,
+                                inbound_rx,
+                                outbound_tx.clone(),
+                                packet.from,
+                                port_map.clone(),
+                            ));
+                        }
+                        Err(e) => {
+                            error!("{:#}", e);
+                        }
+                    }
+                }
+
+                // Now there should be a udp forwarder that can receive the packet
+                let m = port_map.read().await;
+                if let Some(tx) = m.get(&packet.from) {
+                    let _ = tx.send(packet.data).await;
+                }
+            }
         }
     }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn run_data_channel_for_socket_stream<T: Transport>(
+    mut conn: T::Stream,
+    local_addr: &str,
+) -> Result<()> {
+    debug!("New data channel starts forwarding");
+
+    let mut local = UnixStream::connect(local_addr)
+        .await
+        .with_context(|| format!("Failed to connect to {}", local_addr))?;
+    let _ = copy_bidirectional(&mut conn, &mut local).await;
+    Ok(())
 }
 
 // Run a UdpSocket for the visitor `from`
@@ -410,7 +442,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             .transport
             .connect(&remote_addr)
             .await
-            .with_context(|| format!("Failed to connect to {}", &self.remote_addr))?;
+            .with_context(|| format!("Failed to connect to {}", self.remote_addr))?;
         T::hint(&conn, SocketOpts::for_control_channel());
 
         // Send hello

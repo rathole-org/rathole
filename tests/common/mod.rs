@@ -10,12 +10,15 @@ use tokio::{
 pub const PING: &str = "ping";
 pub const PONG: &str = "pong";
 
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+pub mod tls;
+
 pub async fn run_rathole_server(
-    config_path: &str,
+    config_path: PathBuf,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let cli = rathole::Cli {
-        config_path: Some(PathBuf::from(config_path)),
+        config_path: Some(config_path),
         server: true,
         client: false,
         ..Default::default()
@@ -24,11 +27,11 @@ pub async fn run_rathole_server(
 }
 
 pub async fn run_rathole_client(
-    config_path: &str,
+    config_path: PathBuf,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let cli = rathole::Cli {
-        config_path: Some(PathBuf::from(config_path)),
+        config_path: Some(config_path),
         server: false,
         client: true,
         ..Default::default()
@@ -108,5 +111,54 @@ pub mod udp {
             assert_eq!(&buf[..n], PING.as_bytes());
             l.send_to(PONG.as_bytes(), addr).await?;
         }
+    }
+}
+
+#[cfg(unix)]
+pub mod socket_stream {
+    use tokio::net::{UnixListener, UnixStream};
+
+    use super::*;
+
+    pub async fn echo_server<P: AsRef<std::path::Path>>(addr: P) -> Result<()> {
+        std::fs::remove_file(&addr).ok();
+
+        let l = UnixListener::bind(&addr)?;
+
+        loop {
+            let (conn, _addr) = l.accept().await?;
+            tokio::spawn(async move {
+                let _ = echo(conn).await;
+            });
+        }
+    }
+
+    pub async fn pingpong_server<P: AsRef<std::path::Path>>(addr: P) -> Result<()> {
+        std::fs::remove_file(&addr).ok();
+
+        let l = UnixListener::bind(&addr)?;
+
+        loop {
+            let (conn, _addr) = l.accept().await?;
+            tokio::spawn(async move {
+                let _ = pingpong(conn).await;
+            });
+        }
+    }
+
+    async fn echo(conn: UnixStream) -> Result<()> {
+        let (mut rd, mut wr) = conn.into_split();
+        io::copy(&mut rd, &mut wr).await?;
+        Ok(())
+    }
+
+    async fn pingpong(mut conn: UnixStream) -> Result<()> {
+        let mut buf = [0u8; PING.len()];
+
+        while conn.read_exact(&mut buf).await? != 0 {
+            assert_eq!(buf, PING.as_bytes());
+            conn.write_all(PONG.as_bytes()).await?;
+        }
+        Ok(())
     }
 }

@@ -3,7 +3,7 @@ use crate::{
     helper::tcp_connect_with_proxy,
 };
 
-use super::{AddrMaybeCached, SocketOpts, Transport};
+use super::{AddrMaybeCached, SocketOpts, Transport, TransportRole};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::net::SocketAddr;
@@ -21,7 +21,7 @@ impl Transport for TcpTransport {
     type Stream = TcpStream;
     type RawStream = TcpStream;
 
-    fn new(config: &TransportConfig) -> Result<Self> {
+    fn new(config: &TransportConfig, _role: TransportRole) -> Result<Self> {
         Ok(TcpTransport {
             socket_opts: SocketOpts::from_cfg(&config.tcp),
             cfg: config.tcp.clone(),

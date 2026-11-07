@@ -1,0 +1,14 @@
+changelog:
+  categories:
+    - title: "Breaking Changes"
+      labels: ["type: breaking", "breaking-change"]
+    - title: "Added"
+      labels: ["type: feature", "enhancement"]
+    - title: "Fixed"
+      labels: ["type: bug", "bug"]
+    - title: "Documentation"
+      labels: ["type: docs", "documentation"]
+    - title: "Maintenance"
+      labels: ["type: chore", "chore", "dependencies"]
+  exclude:
+    labels: ["skip-changelog"]

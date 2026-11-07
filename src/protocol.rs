@@ -52,10 +52,13 @@ pub enum ControlChannelCmd {
     HeartBeat,
 }
 
+#[allow(clippy::enum_variant_names)] // to keep consistent naming
 #[derive(Deserialize, Serialize, Debug)]
 pub enum DataChannelCmd {
     StartForwardTcp,
     StartForwardUdp,
+    #[cfg(unix)]
+    StartForwardSocketStream,
 }
 
 type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet

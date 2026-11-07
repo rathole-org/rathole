@@ -8,7 +8,10 @@ use std::{
     env,
     path::{Path, PathBuf},
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::{
+    sync::{broadcast, mpsc},
+    task::JoinHandle,
+};
 use tracing::{error, info, instrument};
 
 #[cfg(feature = "notify")]
@@ -95,6 +98,7 @@ impl InstanceConfig for ClientConfig {
 
 pub struct ConfigWatcherHandle {
     pub event_rx: mpsc::UnboundedReceiver<ConfigChange>,
+    task: JoinHandle<Result<()>>,
 }
 
 impl ConfigWatcherHandle {
@@ -107,14 +111,26 @@ impl ConfigWatcherHandle {
             .send(ConfigChange::General(Box::new(origin_cfg.clone())))
             .unwrap();
 
-        tokio::spawn(config_watcher(
+        let task = tokio::spawn(config_watcher(
             path.to_owned(),
             shutdown_rx,
             event_tx,
             origin_cfg,
         ));
 
-        Ok(ConfigWatcherHandle { event_rx })
+        Ok(ConfigWatcherHandle { event_rx, task })
+    }
+
+    pub async fn wait(&mut self) -> Result<()> {
+        (&mut self.task)
+            .await
+            .context("configuration watcher task panicked")?
+    }
+}
+
+impl Drop for ConfigWatcherHandle {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 

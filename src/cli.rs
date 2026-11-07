@@ -1,7 +1,7 @@
-use clap::{AppSettings, ArgGroup, Parser};
+use clap::{ArgGroup, Parser, ValueEnum};
 use lazy_static::lazy_static;
 
-#[derive(clap::ArgEnum, Clone, Debug, Copy)]
+#[derive(ValueEnum, Clone, Debug, Copy)]
 pub enum KeypairType {
     X25519,
     X448,
@@ -9,7 +9,7 @@ pub enum KeypairType {
 
 lazy_static! {
     static ref VERSION: &'static str =
-        option_env!("VERGEN_GIT_SEMVER_LIGHTWEIGHT").unwrap_or(env!("VERGEN_BUILD_SEMVER"));
+        option_env!("VERGEN_GIT_DESCRIBE").unwrap_or(env!("VERGEN_BUILD_SEMVER"));
     static ref LONG_VERSION: String = format!(
         "
 Build Timestamp:     {}
@@ -33,36 +33,54 @@ cargo Features:      {}
 }
 
 #[derive(Parser, Debug, Default, Clone)]
-#[clap(
+#[command(
     about,
-    version(*VERSION),
-    long_version(LONG_VERSION.as_str()),
-    setting(AppSettings::DeriveDisplayOrder)
+    version = *VERSION,
+    long_version = LONG_VERSION.as_str(),
+    // AppSettings::DeriveDisplayOrder has no direct v4 enum replacement.
+    // clap v4 generally respects declaration order; keep or add explicit display_order if needed.
 )]
-#[clap(group(
-            ArgGroup::new("cmds")
-                .required(true)
-                .args(&["CONFIG", "genkey"]),
-        ))]
+#[command(group(
+    ArgGroup::new("cmds")
+        .required(true)
+        .args(&["CONFIG", "genkey"]),
+))]
 pub struct Cli {
     /// The path to the configuration file
     ///
     /// Running as a client or a server is automatically determined
     /// according to the configuration file.
-    #[clap(parse(from_os_str), name = "CONFIG")]
+    #[arg(id = "CONFIG", value_name = "CONFIG")]
     pub config_path: Option<std::path::PathBuf>,
 
     /// Run as a server
-    #[clap(long, short, group = "mode")]
+    #[arg(long, short, group = "mode")]
     pub server: bool,
 
     /// Run as a client
-    #[clap(long, short, group = "mode")]
+    #[arg(long, short, group = "mode")]
     pub client: bool,
 
     /// Generate a keypair for the use of the noise protocol
     ///
     /// The DH function to use is x25519
-    #[clap(long, arg_enum, value_name = "CURVE")]
+    #[arg(
+        long,
+        value_enum,
+        value_name = "CURVE",
+        num_args = 0..=1,
+        default_missing_value = "x25519"
+    )]
     pub genkey: Option<Option<KeypairType>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_is_valid() {
+        Cli::command().debug_assert();
+    }
 }

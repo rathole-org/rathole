@@ -1,0 +1,31 @@
+[client]
+remote_addr = "127.0.0.1:2344"
+default_token = "default_token_if_not_specify"
+
+[client.transport]
+type = "noise"
+[client.transport.noise]
+remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+
+[client.services.echo]
+type = "socket_stream"
+local_addr = "/tmp/rathole_integration_test/echo.sock"
+[client.services.pingpong]
+type = "socket_stream"
+local_addr = "/tmp/rathole_integration_test/pingpong.sock"
+
+[server]
+bind_addr = "0.0.0.0:2344"
+default_token = "default_token_if_not_specify"
+
+[server.transport]
+type = "noise"
+[server.transport.noise]
+local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
+
+[server.services.echo]
+type = "socket_stream"
+bind_addr = "/tmp/rathole_integration_test/echo_exposed.sock"
+[server.services.pingpong]
+type = "socket_stream"
+bind_addr = "/tmp/rathole_integration_test/pingpong_exposed.sock"

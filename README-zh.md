@@ -2,11 +2,11 @@
 
 ![rathole-logo](./docs/img/rathole-logo.png)
 
-[![GitHub stars](https://img.shields.io/github/stars/rapiz1/rathole)](https://github.com/rapiz1/rathole/stargazers)
-[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/rapiz1/rathole)](https://github.com/rapiz1/rathole/releases)
-![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/rapiz1/rathole/rust.yml?branch=main)
-[![GitHub all releases](https://img.shields.io/github/downloads/rapiz1/rathole/total)](https://github.com/rapiz1/rathole/releases)
-[![Docker Pulls](https://img.shields.io/docker/pulls/rapiz1/rathole)](https://hub.docker.com/r/rapiz1/rathole)
+[![GitHub stars](https://img.shields.io/github/stars/rathole-org/rathole)](https://github.com/rathole-org/rathole/stargazers)
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/rathole-org/rathole)](https://github.com/rathole-org/rathole/releases)
+![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/rathole-org/rathole/rust.yml?branch=main)
+[![GitHub all releases](https://img.shields.io/github/downloads/rathole-org/rathole/total)](https://github.com/rathole-org/rathole/releases)
+[![Container image](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/orgs/rathole-org/packages/container/package/rathole)
 
 [English](README.md) | [简体中文](README-zh.md)
 
@@ -36,7 +36,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 
 ## Quickstart
 
-一个全功能的 `rathole` 可以从 [release](https://github.com/rapiz1/rathole/releases) 页面下载。或者 [从源码编译](docs/build-guide.md) **获取其他平台和最小化的二进制文件**。
+[release](https://github.com/rathole-org/rathole/releases) 页面中，文件名以 `-embedded` 结尾的压缩包使用精简功能集，不包含 TLS 和 WebSocket 传输；其他二进制文件为全功能版本。也可以 [从源码编译](docs/build-guide.md) **获取其他平台或最小化的二进制文件**。
 
 `rathole` 的使用和 frp 非常类似，如果你有后者的使用经验，那配置对你来说非常简单，区别只是转发服务的配置分离到了服务端和客户端，并且必须要设置 token。
 
@@ -143,6 +143,9 @@ local_addr = "127.0.0.1:1082"
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+auth_fail_limit = 10 # Optional. Failed handshakes from one source (an IPv4 address or IPv6 /64) within a minute before it is refused. Set to 0 to disable. Default: 10
+auth_ban_secs = 300 # Optional. How long a source that hit `auth_fail_limit` is refused, in seconds. Default: 300
+log_ips = true # Optional. Whether logs show the IP addresses of clients and visitors. When false they appear as `<redacted>`. Default: true
 
 [server.transport] # Same as `[client.transport]`
 type = "tcp"
@@ -160,6 +163,7 @@ pkcs12_password = "password" # Necessary. Password of the pkcs12 file
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
 local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
+remote_public_keys = ["key_encoded_in_base64"] # Optional. More client public keys allowed to connect, added to `remote_public_key`. Only for patterns that authenticate the client, e.g. KK, XK, IK. See docs/transport.md
 
 [server.transport.websocket] # Necessary if `type` is "websocket"
 tls = true # If `true` then it will use settings in `server.transport.tls`

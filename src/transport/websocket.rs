@@ -4,9 +4,9 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
-use super::{AddrMaybeCached, SocketOpts, TcpTransport, TlsTransport, Transport};
+use super::{AddrMaybeCached, SocketOpts, TcpTransport, TlsTransport, Transport, TransportRole};
 use crate::config::TransportConfig;
-use anyhow::anyhow;
+use anyhow::{anyhow, Context as _};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::stream::Stream;
@@ -27,7 +27,7 @@ use url::Url;
 #[derive(Debug)]
 enum TransportStream {
     Insecure(TcpStream),
-    Secure(TlsStream<TcpStream>),
+    Secure(Box<TlsStream<TcpStream>>),
 }
 
 impl TransportStream {
@@ -94,9 +94,7 @@ impl Stream for StreamWrapper {
         match Pin::new(&mut self.get_mut().inner).poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Err(err))) => {
-                Poll::Ready(Some(Err(Error::new(ErrorKind::Other, err))))
-            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(Error::other(err)))),
             Poll::Ready(Some(Ok(res))) => {
                 if let Message::Binary(b) = res {
                     Poll::Ready(Some(Ok(Bytes::from(b))))
@@ -147,26 +145,24 @@ impl AsyncWrite for WebsocketTunnel {
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         let sw = self.get_mut().inner.get_mut();
-        ready!(Pin::new(&mut sw.inner)
-            .poll_ready(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err)))?;
+        ready!(Pin::new(&mut sw.inner).poll_ready(cx).map_err(Error::other))?;
 
         match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec())) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+            Err(e) => Poll::Ready(Err(Error::other(e))),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Pin::new(&mut self.get_mut().inner.get_mut().inner)
             .poll_flush(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Pin::new(&mut self.get_mut().inner.get_mut().inner)
             .poll_close(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 }
 
@@ -188,7 +184,7 @@ impl Transport for WebsocketTransport {
     type RawStream = TcpStream;
     type Stream = WebsocketTunnel;
 
-    fn new(config: &TransportConfig) -> anyhow::Result<Self> {
+    fn new(config: &TransportConfig, role: TransportRole) -> anyhow::Result<Self> {
         let wsconfig = config
             .websocket
             .as_ref()
@@ -199,8 +195,8 @@ impl Transport for WebsocketTransport {
             ..WebSocketConfig::default()
         };
         let sub = match wsconfig.tls {
-            true => SubTransport::Secure(TlsTransport::new(config)?),
-            false => SubTransport::Insecure(TcpTransport::new(config)?),
+            true => SubTransport::Secure(TlsTransport::new(config, role)?),
+            false => SubTransport::Insecure(TcpTransport::new(config, role)?),
         };
         Ok(WebsocketTransport { sub, conf })
     }
@@ -227,7 +223,7 @@ impl Transport for WebsocketTransport {
     async fn handshake(&self, conn: Self::RawStream) -> anyhow::Result<Self::Stream> {
         let tsream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.handshake(conn).await?),
-            SubTransport::Secure(t) => TransportStream::Secure(t.handshake(conn).await?),
+            SubTransport::Secure(t) => TransportStream::Secure(Box::new(t.handshake(conn).await?)),
         };
         let wsstream = accept_async_with_config(tsream, Some(self.conf)).await?;
         let tun = WebsocketTunnel {
@@ -237,18 +233,64 @@ impl Transport for WebsocketTransport {
     }
 
     async fn connect(&self, addr: &AddrMaybeCached) -> anyhow::Result<Self::Stream> {
-        let u = format!("ws://{}", &addr.addr.as_str());
-        let url = Url::parse(&u).unwrap();
+        let u = format!("ws://{}", addr.addr.as_str());
+        let url = Url::parse(&u).with_context(|| format!("Invalid WebSocket URL `{u}`"))?;
         let tstream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.connect(addr).await?),
-            SubTransport::Secure(t) => TransportStream::Secure(t.connect(addr).await?),
+            SubTransport::Secure(t) => TransportStream::Secure(Box::new(t.connect(addr).await?)),
         };
         let (wsstream, _) = client_async_with_config(url, tstream, Some(self.conf))
             .await
-            .expect("failed to connect");
+            .context("Failed to complete WebSocket client handshake")?;
         let tun = WebsocketTunnel {
             inner: StreamReader::new(StreamWrapper { inner: wsstream }),
         };
         Ok(tun)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{TlsConfig, TransportType, WebsocketConfig};
+    use std::fs;
+
+    fn secure_websocket_transport(tls: TlsConfig) -> TransportConfig {
+        TransportConfig {
+            transport_type: TransportType::Websocket,
+            tls: Some(tls),
+            websocket: Some(WebsocketConfig { tls: true }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn secure_websocket_server_without_identity_returns_error() {
+        let config = secure_websocket_transport(TlsConfig {
+            hostname: None,
+            trusted_root: None,
+            pkcs12: None,
+            pkcs12_password: None,
+        });
+
+        let error = WebsocketTransport::new(&config, TransportRole::Server)
+            .expect_err("missing server identity should fail during transport construction");
+        assert!(error.to_string().contains("tls.pkcs12"));
+    }
+
+    #[test]
+    fn secure_websocket_client_with_invalid_trust_returns_error() -> anyhow::Result<()> {
+        let trusted_root = tempfile::NamedTempFile::new()?;
+        fs::write(trusted_root.path(), b"not a PEM certificate")?;
+        let config = secure_websocket_transport(TlsConfig {
+            hostname: None,
+            trusted_root: Some(trusted_root.path().to_string_lossy().into_owned()),
+            pkcs12: None,
+            pkcs12_password: None,
+        });
+
+        WebsocketTransport::new(&config, TransportRole::Client)
+            .expect_err("invalid client trust should fail during transport construction");
+        Ok(())
     }
 }

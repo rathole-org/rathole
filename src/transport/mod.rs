@@ -14,6 +14,12 @@ pub const DEFAULT_NODELAY: bool = true;
 pub const DEFAULT_KEEPALIVE_SECS: u64 = 20;
 pub const DEFAULT_KEEPALIVE_INTERVAL: u64 = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportRole {
+    Client,
+    Server,
+}
+
 #[derive(Clone)]
 pub struct AddrMaybeCached {
     pub addr: String,
@@ -55,7 +61,7 @@ pub trait Transport: Debug + Send + Sync {
     type RawStream: Send + Sync;
     type Stream: 'static + AsyncRead + AsyncWrite + Unpin + Send + Sync + Debug;
 
-    fn new(config: &TransportConfig) -> Result<Self>
+    fn new(config: &TransportConfig, role: TransportRole) -> Result<Self>
     where
         Self: Sized;
     /// Provide the transport with socket options, which can be handled at the need of the transport

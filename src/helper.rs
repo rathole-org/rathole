@@ -470,3 +470,13 @@ mod proxy_protocol_tests {
         header_is_sent_before_payload("v2").await;
     }
 }
+
+/// Compare two byte strings in time that depends only on their lengths, so
+/// response timing doesn't reveal how much of a secret a guess got right.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
+}

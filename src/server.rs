@@ -1,7 +1,10 @@
+use crate::auth_throttle::{AuthThrottle, Failure, SourceKey};
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
-use crate::helper::{generate_proxy_protocol_header, retry_notify_with_deadline, write_and_flush};
+use crate::helper::{
+    constant_time_eq, generate_proxy_protocol_header, retry_notify_with_deadline, write_and_flush,
+};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
@@ -15,6 +18,7 @@ use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -44,6 +48,10 @@ const SOCKET_STREAM_POOL_SIZE: usize = 8; // The number of cached connections fo
 
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+                                  // Timeout for each read of the rathole handshake (hello, auth) that follows it
+const PROTO_READ_TIMEOUT: Duration = Duration::from_secs(10);
+// Window in which `auth_fail_limit` failures get a source banned
+const AUTH_FAIL_WINDOW: Duration = Duration::from_secs(60);
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -110,6 +118,8 @@ struct Server<T: Transport> {
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     // Wrapper around the transport layer
     transport: Arc<T>,
+    // Failed-handshake counts per source
+    throttle: Arc<AuthThrottle>,
 }
 
 // Generate a hash map of services which is indexed by ServiceDigest
@@ -130,11 +140,17 @@ impl<T: 'static + Transport> Server<T> {
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
         let transport = Arc::new(T::new(&config.transport, TransportRole::Server)?);
+        let throttle = Arc::new(AuthThrottle::new(
+            config.auth_fail_limit,
+            AUTH_FAIL_WINDOW,
+            Duration::from_secs(config.auth_ban_secs),
+        ));
         Ok(Server {
             config,
             services,
             control_channels,
             transport,
+            throttle,
         })
     }
 
@@ -186,26 +202,30 @@ impl<T: 'static + Transport> Server<T> {
                         Ok((conn, addr)) => {
                             backoff.reset();
 
+                            // Refuse throttled sources before spending a transport handshake on them
+                            if self.throttle.is_blocked(addr.ip()) {
+                                debug!(%addr, "Dropping connection from a throttled source");
+                                continue;
+                            }
+
                             // Do transport handshake with a timeout
                             match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
-                                Ok(conn) => {
-                                    match conn.with_context(|| "Failed to do transport handshake") {
-                                        Ok(conn) => {
-                                            let services = self.services.clone();
-                                            let control_channels = self.control_channels.clone();
-                                            let server_config = self.config.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
-                                                    error!("{:#}", err);
-                                                }
-                                            }.instrument(info_span!("connection", %addr)));
-                                        }, Err(e) => {
-                                            error!("{:#}", e);
+                                Ok(Ok(conn)) => {
+                                    let services = self.services.clone();
+                                    let control_channels = self.control_channels.clone();
+                                    let server_config = self.config.clone();
+                                    let throttle = self.throttle.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) = handle_connection(conn, addr, services, control_channels, server_config, &throttle).await {
+                                            note_handshake_failure(&throttle, addr, &err);
                                         }
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Transport handshake timeout: {}", e);
+                                    }.instrument(info_span!("connection", %addr)));
+                                }
+                                Ok(Err(e)) => {
+                                    note_handshake_failure(&self.throttle, addr, &e.context("Failed to do transport handshake"));
+                                }
+                                Err(_) => {
+                                    note_handshake_failure(&self.throttle, addr, &anyhow!("Transport handshake timeout"));
                                 }
                             }
                         }
@@ -254,14 +274,43 @@ impl<T: 'static + Transport> Server<T> {
 }
 
 // Handle connections to `server.bind_addr`
+/// Log a failed handshake and count it against the source. Logging stops once
+/// the source is banned, so a scanner produces a bounded number of lines.
+fn note_handshake_failure(throttle: &AuthThrottle, addr: SocketAddr, err: &anyhow::Error) {
+    match throttle.record_failure(addr.ip()) {
+        Failure::Counted(_) => warn!(%addr, "{:#}", err),
+        Failure::Banned => warn!(
+            %addr,
+            "{:#}. Refusing {} for {}s after repeated failed handshakes",
+            err,
+            SourceKey::from_ip(addr.ip()),
+            throttle.ban_duration().as_secs()
+        ),
+        Failure::AlreadyBanned => debug!(%addr, "{:#}", err),
+    }
+}
+
+/// Read one handshake message, giving up after `PROTO_READ_TIMEOUT` so idle
+/// connections can't pile up between the transport handshake and auth
+async fn read_with_deadline<F: std::future::Future<Output = Result<R>>, R>(
+    what: &str,
+    f: F,
+) -> Result<R> {
+    time::timeout(PROTO_READ_TIMEOUT, f)
+        .await
+        .map_err(|_| anyhow!("Timed out waiting for {}", what))?
+}
+
 async fn handle_connection<T: 'static + Transport>(
     mut conn: T::Stream,
+    addr: SocketAddr,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
+    throttle: &AuthThrottle,
 ) -> Result<()> {
     // Read hello
-    let hello = read_hello(&mut conn).await?;
+    let hello = read_with_deadline("hello", read_hello(&mut conn)).await?;
     match hello {
         ControlChannelHello(_, service_digest) => {
             do_control_channel_handshake(
@@ -272,6 +321,7 @@ async fn handle_connection<T: 'static + Transport>(
                 server_config,
             )
             .await?;
+            throttle.record_success(addr.ip());
         }
         DataChannelHello(_, nonce) => {
             do_data_channel_handshake(conn, control_channels, nonce).await?;
@@ -304,16 +354,23 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         .await?;
     conn.flush().await?;
 
+    // Read auth before revealing anything about the service: an unknown service
+    // gets the same reply as a wrong token, so service names can't be enumerated
+    let protocol::Auth(d) = read_with_deadline("auth", read_auth(&mut conn)).await?;
+
     // Lookup the service
     let service_config = match services.read().await.get(&service_digest) {
-        Some(v) => v,
+        Some(v) => v.to_owned(),
         None => {
-            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
+            conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
                 .await?;
-            bail!("No such a service {}", hex::encode(service_digest));
+            conn.flush().await?;
+            bail!(
+                "Control channel for unknown service {} refused",
+                hex::encode(service_digest)
+            );
         }
-    }
-    .to_owned();
+    };
 
     let service_name = &service_config.name;
 
@@ -321,19 +378,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
     concat.append(&mut nonce);
 
-    // Read auth
-    let protocol::Auth(d) = read_auth(&mut conn).await?;
-
     // Validate
     let session_key = protocol::digest(&concat);
-    if session_key != d {
+    if !constant_time_eq(&session_key, &d) {
         conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
             .await?;
-        debug!(
-            "Expect {}, but got {}",
-            hex::encode(session_key),
-            hex::encode(d)
-        );
+        conn.flush().await?;
         bail!("Service {} failed the authentication", service_name);
     } else {
         let mut h = control_channels.write().await;
@@ -391,6 +441,9 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
                 .with_context(|| "Data channel for a stale control channel")?;
         }
         None => {
+            // Not counted against the source: a legitimate client can race a
+            // restart or hot reload with stale nonces, and a 32-byte nonce
+            // can't be guessed anyway
             warn!("Data channel has incorrect nonce");
         }
     }

@@ -143,6 +143,8 @@ local_addr = "127.0.0.1:1082"
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+auth_fail_limit = 10 # Optional. Failed handshakes from one source (an IPv4 address or IPv6 /64) within a minute before it is refused. Set to 0 to disable. Default: 10
+auth_ban_secs = 300 # Optional. How long a source that hit `auth_fail_limit` is refused, in seconds. Default: 300
 
 [server.transport] # Same as `[client.transport]`
 type = "tcp"

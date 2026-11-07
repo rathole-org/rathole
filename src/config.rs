@@ -267,6 +267,21 @@ pub struct ServerConfig {
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+    /// Failed handshakes from one source (an IPv4 address or IPv6 /64) within a
+    /// minute before it is banned. 0 disables the throttle.
+    #[serde(default = "default_auth_fail_limit")]
+    pub auth_fail_limit: u32,
+    /// How long a throttled source is refused, in seconds
+    #[serde(default = "default_auth_ban_secs")]
+    pub auth_ban_secs: u64,
+}
+
+fn default_auth_fail_limit() -> u32 {
+    10
+}
+
+fn default_auth_ban_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
